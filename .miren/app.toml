@@ -1,0 +1,38 @@
+name = "chitchat"
+
+[services.web]
+command = "/app/gateway"
+port = 8080
+
+[services.web.concurrency]
+mode = "fixed"
+num_instances = 1
+
+[services.nats]
+command = "/run-nats.sh"
+
+[services.nats.concurrency]
+mode = "fixed"
+num_instances = 1
+
+[[services.nats.disks]]
+name = "data"
+provider = "local"
+mount_path = "/miren/data/local"
+
+[[env]]
+key = "NATS_URL"
+value = "nats://nats.app.miren:4222"
+
+[[env]]
+key = "GATEWAY_API_KEY"
+required = true
+sensitive = true
+
+[[env]]
+key = "MULTIPASS_BASE_URL"
+description = "Optional. Set to enable multipass JWT auth (e.g. https://multipass.miren.cloud)"
+
+[[env]]
+key = "ALLOWED_DOMAIN"
+description = "Optional. Restrict multipass JWTs to this email domain (e.g. miren.dev)"

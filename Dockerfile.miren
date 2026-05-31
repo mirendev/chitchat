@@ -1,0 +1,26 @@
+FROM nats:2.10-alpine AS nats
+
+FROM golang:1.25-alpine AS builder
+
+RUN apk add --no-cache git ca-certificates
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /gateway ./cmd/gateway
+
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates bash
+
+COPY --from=nats /usr/local/bin/nats-server /usr/local/bin/nats-server
+
+COPY nats-server.conf /etc/nats/nats-server.conf
+
+COPY --from=builder /gateway /app/gateway
+
+COPY run-nats.sh /run-nats.sh
+RUN chmod +x /run-nats.sh
+
+EXPOSE 8080 4222 8222
