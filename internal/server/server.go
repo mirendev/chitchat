@@ -66,6 +66,8 @@ func (s *Server) Handler() http.Handler {
 
 	v1.HandleFunc("/ack", s.ackMessage).Methods(http.MethodPost)
 
+	v1.HandleFunc("/sessions/{name}", s.deleteSession).Methods(http.MethodDelete)
+
 	return r
 }
 
@@ -636,6 +638,25 @@ func (s *Server) ackMessage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// --- Sessions ---
+
+// deleteSession tears down a durable session's consumers immediately rather
+// than waiting for the inactivity timeout. Optional ?subject= scopes it to a
+// single subject; otherwise every consumer for the session is removed.
+func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request) {
+	sessionID := mux.Vars(r)["name"]
+	subject := r.URL.Query().Get("subject")
+
+	n, err := s.teardownSession(r.Context(), sessionID, subject)
+	if err != nil {
+		s.logger.Error("session teardown failed", "session", sessionID, "err", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"session_id": sessionID, "deleted": n})
+}
+
 // --- Pending Ack Management ---
 
 func (s *Server) storePending(msg jetstream.Msg) string {
@@ -698,4 +719,3 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(v)
 }
-

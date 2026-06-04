@@ -288,6 +288,16 @@ Requirements and notes:
 
 `unsubscribe` stops delivery but keeps the durable cursor so the session can resume later; the cursor is only reclaimed by the inactivity timeout above.
 
+**Tearing a session down explicitly.** When a session is permanently done, delete its durable consumer(s) immediately instead of waiting out the 24h inactivity timeout — over the WebSocket:
+
+```json
+{"action": "teardown", "session_id": "billing-svc"}
+```
+
+Response: `{"type": "torn_down", "session_id": "billing-svc", "count": 1}` (`count` is the number of consumers removed). Add a `subject` to scope the teardown to one subscription instead of the whole session. Any live binding for that session on the current connection is stopped first; if the session is live on another connection, that connection is told `{"type": "unsubscribed", ...}`.
+
+You can also tear down out-of-band over HTTP (useful when the client has crashed and a cleanup process wants to reclaim the session) — see [Delete a Session](#delete-a-session).
+
 #### Keepalives & reconnection
 
 The gateway runs an application-level keepalive on every WebSocket connection. Clients must cooperate or they will be disconnected.
@@ -458,6 +468,30 @@ POST /v1/ack
   "ack_id": "a1b2c3d4e5f6..."
 }
 ```
+
+---
+
+### Delete a Session
+
+Tear down a durable session's consumer(s) immediately, rather than waiting for the 24h inactivity timeout. Works whether or not the session is currently connected — handy for reclaiming sessions left behind by a crashed client.
+
+```
+DELETE /v1/sessions/{session_id}
+```
+
+Optional `?subject=` scopes the teardown to a single subscription; without it, every consumer belonging to the session is removed.
+
+```bash
+# Tear down the whole session
+curl -X DELETE https://chitchat.example.com/v1/sessions/billing-svc \
+  -H "Authorization: Bearer $KEY"
+
+# Tear down just one subscription within the session
+curl -X DELETE "https://chitchat.example.com/v1/sessions/billing-svc?subject=announce.%3E" \
+  -H "Authorization: Bearer $KEY"
+```
+
+Response: `{"session_id": "billing-svc", "deleted": 1}` — `deleted` is the number of consumers removed (0 if the session had none). After teardown, a client that reconnects with the same `session_id` starts fresh and replays whatever is still in the stream buffer.
 
 ---
 

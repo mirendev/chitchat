@@ -31,7 +31,14 @@ const (
 	// with no connection bound before JetStream cleans it up. A session that
 	// reconnects within this window resumes from where it left off; one gone
 	// longer gets a fresh consumer that replays whatever is still buffered.
+	// A client can also tear a session down explicitly instead of waiting.
 	sessionInactiveThreshold = 24 * time.Hour
+
+	// sessionMetaKey / sessionMetaSubjectKey tag each durable session consumer
+	// with the session id and subject it belongs to, so a session can be torn
+	// down by finding its consumers without parsing the (hashed) durable name.
+	sessionMetaKey        = "chitchat_session"
+	sessionMetaSubjectKey = "chitchat_subject"
 )
 
 var upgrader = websocket.Upgrader{
@@ -60,6 +67,7 @@ type wsOutbound struct {
 	Error        string            `json:"error,omitempty"`
 	ReplySubject string            `json:"reply_subject,omitempty"`
 	SessionID    string            `json:"session_id,omitempty"`
+	Count        int               `json:"count,omitempty"`
 }
 
 func (s *Server) websocketHandler(w http.ResponseWriter, r *http.Request) {
@@ -77,9 +85,15 @@ func (s *Server) websocketHandler(w http.ResponseWriter, r *http.Request) {
 		ctx:         ctx,
 		cancel:      cancel,
 		subs:        make(map[string]*nats.Subscription),
-		jsConsumers: make(map[string]jetstream.ConsumeContext),
+		jsConsumers: make(map[string]*jsSub),
 	}
 	c.run()
+}
+
+// jsSub is a live durable session subscription bound to this connection.
+type jsSub struct {
+	cc        jetstream.ConsumeContext
+	sessionID string
 }
 
 type wsConn struct {
@@ -92,8 +106,8 @@ type wsConn struct {
 
 	writeMu     sync.Mutex
 	mu          sync.Mutex
-	subs        map[string]*nats.Subscription       // core NATS subscriptions, keyed by subject
-	jsConsumers map[string]jetstream.ConsumeContext // durable session consumers, keyed by subject
+	subs        map[string]*nats.Subscription // core NATS subscriptions, keyed by subject
+	jsConsumers map[string]*jsSub             // durable session consumers, keyed by subject
 }
 
 func (c *wsConn) run() {
@@ -108,8 +122,8 @@ func (c *wsConn) run() {
 		}
 		// Stop consuming but keep the durable consumer so its position survives
 		// for the session's next reconnect.
-		for subj, cc := range c.jsConsumers {
-			cc.Stop()
+		for subj, e := range c.jsConsumers {
+			e.cc.Stop()
 			delete(c.jsConsumers, subj)
 		}
 		c.mu.Unlock()
@@ -148,6 +162,8 @@ func (c *wsConn) run() {
 			c.handleSubscribe(msg)
 		case "unsubscribe":
 			c.handleUnsubscribe(msg)
+		case "teardown":
+			c.handleTeardown(msg)
 		case "publish":
 			c.handlePublish(msg)
 		default:
@@ -255,6 +271,10 @@ func (c *wsConn) handleDurableSubscribe(msg wsInbound) {
 			AckPolicy:         jetstream.AckExplicitPolicy,
 			DeliverPolicy:     jetstream.DeliverAllPolicy,
 			InactiveThreshold: sessionInactiveThreshold,
+			Metadata: map[string]string{
+				sessionMetaKey:        sessionID,
+				sessionMetaSubjectKey: subject,
+			},
 		})
 	}
 	if err != nil {
@@ -262,36 +282,49 @@ func (c *wsConn) handleDurableSubscribe(msg wsInbound) {
 		return
 	}
 
-	cc, err := cons.Consume(func(m jetstream.Msg) {
-		out := wsOutbound{
-			Type:      "message",
-			Subject:   m.Subject(),
-			Data:      base64.StdEncoding.EncodeToString(m.Data()),
-			SessionID: sessionID,
-		}
-		if hdrs := m.Headers(); len(hdrs) > 0 {
-			out.Headers = make(map[string]string)
-			for k := range hdrs {
-				out.Headers[k] = hdrs.Get(k)
+	cc, err := cons.Consume(
+		func(m jetstream.Msg) {
+			out := wsOutbound{
+				Type:      "message",
+				Subject:   m.Subject(),
+				Data:      base64.StdEncoding.EncodeToString(m.Data()),
+				SessionID: sessionID,
 			}
-		}
-		if err := c.sendErr(out); err != nil {
-			// Write failed: the connection is gone. Don't ack — the message is
-			// redelivered to this session on reconnect. Tear the connection down;
-			// run()'s cleanup stops this consumer.
-			m.Nak()
-			c.conn.Close()
-			return
-		}
-		m.Ack()
-	})
+			if hdrs := m.Headers(); len(hdrs) > 0 {
+				out.Headers = make(map[string]string)
+				for k := range hdrs {
+					out.Headers[k] = hdrs.Get(k)
+				}
+			}
+			if err := c.sendErr(out); err != nil {
+				// Write failed: the connection is gone. Don't ack — the message is
+				// redelivered to this session on reconnect. Tear the connection
+				// down; run()'s cleanup stops this consumer.
+				m.Nak()
+				c.conn.Close()
+				return
+			}
+			m.Ack()
+		},
+		jetstream.ConsumeErrHandler(func(_ jetstream.ConsumeContext, cerr error) {
+			// The durable was deleted out from under us (e.g. an explicit
+			// teardown from another connection or the HTTP endpoint). Drop the
+			// local binding and tell the client the subscription is gone.
+			if errors.Is(cerr, jetstream.ErrConsumerDeleted) || errors.Is(cerr, jetstream.ErrConsumerNotFound) {
+				c.mu.Lock()
+				delete(c.jsConsumers, subject)
+				c.mu.Unlock()
+				c.send(wsOutbound{Type: "unsubscribed", Subject: subject, SessionID: sessionID})
+			}
+		}),
+	)
 	if err != nil {
 		c.send(wsOutbound{Type: "error", Error: "consume failed: " + err.Error()})
 		return
 	}
 
 	c.mu.Lock()
-	c.jsConsumers[subject] = cc
+	c.jsConsumers[subject] = &jsSub{cc: cc, sessionID: sessionID}
 	c.mu.Unlock()
 
 	c.send(wsOutbound{Type: "subscribed", Subject: subject, SessionID: sessionID})
@@ -308,7 +341,7 @@ func (c *wsConn) handleUnsubscribe(msg wsInbound) {
 	if isCore {
 		delete(c.subs, msg.Subject)
 	}
-	cc, isDurable := c.jsConsumers[msg.Subject]
+	e, isDurable := c.jsConsumers[msg.Subject]
 	if isDurable {
 		delete(c.jsConsumers, msg.Subject)
 	}
@@ -324,9 +357,92 @@ func (c *wsConn) handleUnsubscribe(msg wsInbound) {
 	}
 	if isDurable {
 		// Stop consuming; the durable consumer is kept so the session can resume.
-		cc.Stop()
+		e.cc.Stop()
 	}
 	c.send(wsOutbound{Type: "unsubscribed", Subject: msg.Subject})
+}
+
+// handleTeardown explicitly deletes a session's durable consumer(s) instead of
+// waiting for the inactivity timeout. With a subject it removes just that
+// (session, subject) consumer; without one it removes every consumer belonging
+// to the session. Live bindings on this connection are stopped first.
+func (c *wsConn) handleTeardown(msg wsInbound) {
+	if msg.SessionID == "" {
+		c.send(wsOutbound{Type: "error", Error: "session_id is required"})
+		return
+	}
+
+	c.mu.Lock()
+	for subj, e := range c.jsConsumers {
+		if e.sessionID == msg.SessionID && (msg.Subject == "" || subj == msg.Subject) {
+			e.cc.Stop()
+			delete(c.jsConsumers, subj)
+		}
+	}
+	c.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(c.ctx, 5*time.Second)
+	defer cancel()
+	n, err := c.server.teardownSession(ctx, msg.SessionID, msg.Subject)
+	if err != nil {
+		c.send(wsOutbound{Type: "error", Error: "teardown failed: " + err.Error()})
+		return
+	}
+	c.send(wsOutbound{Type: "torn_down", SessionID: msg.SessionID, Subject: msg.Subject, Count: n})
+}
+
+// teardownSession deletes durable session consumers. With a subject it deletes
+// the single (session, subject) consumer; without one it scans every stream and
+// deletes consumers tagged with this session id. Returns the number removed.
+func (s *Server) teardownSession(ctx context.Context, sessionID, subject string) (int, error) {
+	if subject != "" {
+		streamName, err := s.js.StreamNameBySubject(ctx, subject)
+		if err != nil {
+			if errors.Is(err, jetstream.ErrStreamNotFound) {
+				return 0, nil
+			}
+			return 0, err
+		}
+		if err := s.js.DeleteConsumer(ctx, streamName, durableName(sessionID, subject)); err != nil {
+			if errors.Is(err, jetstream.ErrConsumerNotFound) {
+				return 0, nil
+			}
+			return 0, err
+		}
+		return 1, nil
+	}
+
+	// Session-wide: collect matching consumers across all streams, then delete.
+	type target struct{ stream, consumer string }
+	var targets []target
+	names := s.js.StreamNames(ctx)
+	for name := range names.Name() {
+		stream, err := s.js.Stream(ctx, name)
+		if err != nil {
+			continue
+		}
+		cl := stream.ListConsumers(ctx)
+		for info := range cl.Info() {
+			if info.Config.Metadata[sessionMetaKey] == sessionID {
+				targets = append(targets, target{name, info.Name})
+			}
+		}
+	}
+	if err := names.Err(); err != nil {
+		return 0, err
+	}
+
+	deleted := 0
+	for _, t := range targets {
+		if err := s.js.DeleteConsumer(ctx, t.stream, t.consumer); err != nil {
+			if errors.Is(err, jetstream.ErrConsumerNotFound) {
+				continue
+			}
+			return deleted, err
+		}
+		deleted++
+	}
+	return deleted, nil
 }
 
 func (c *wsConn) handlePublish(msg wsInbound) {
