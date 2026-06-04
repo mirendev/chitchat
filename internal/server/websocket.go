@@ -6,9 +6,20 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/nats-io/nats.go"
+)
+
+const (
+	// pongWait is how long we wait for a pong (or any frame) before considering
+	// the connection dead. pingPeriod must be shorter so a ping always lands
+	// before the deadline. writeWait bounds a single write so a wedged client
+	// can't block the NATS callback forever.
+	pongWait   = 60 * time.Second
+	pingPeriod = (pongWait * 9) / 10
+	writeWait  = 10 * time.Second
 )
 
 var upgrader = websocket.Upgrader{
@@ -61,7 +72,9 @@ type wsConn struct {
 }
 
 func (c *wsConn) run() {
+	done := make(chan struct{})
 	defer func() {
+		close(done)
 		c.mu.Lock()
 		for subj, sub := range c.subs {
 			sub.Unsubscribe()
@@ -71,6 +84,17 @@ func (c *wsConn) run() {
 		c.conn.Close()
 	}()
 
+	// Keepalive: a dead or wedged peer is detected within pongWait. The read
+	// deadline is reset on every pong and on every inbound frame; the ping
+	// loop keeps an otherwise-idle connection warm against intermediary
+	// timeouts (load balancers, NAT) that would silently drop it.
+	c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.conn.SetPongHandler(func(string) error {
+		c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+	go c.pingLoop(done)
+
 	for {
 		_, raw, err := c.conn.ReadMessage()
 		if err != nil {
@@ -79,6 +103,7 @@ func (c *wsConn) run() {
 			}
 			return
 		}
+		c.conn.SetReadDeadline(time.Now().Add(pongWait))
 
 		var msg wsInbound
 		if err := json.Unmarshal(raw, &msg); err != nil {
@@ -204,9 +229,27 @@ func (c *wsConn) handlePublish(msg wsInbound) {
 	c.send(wsOutbound{Type: "published", Subject: msg.Subject})
 }
 
+func (c *wsConn) pingLoop(done <-chan struct{}) {
+	ticker := time.NewTicker(pingPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			// WriteControl is safe to call concurrently with the data writer,
+			// so a ping still goes out even if a data write is in flight.
+			if err := c.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeWait)); err != nil {
+				return
+			}
+		case <-done:
+			return
+		}
+	}
+}
+
 func (c *wsConn) send(msg wsOutbound) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 	if err := c.conn.WriteJSON(msg); err != nil {
 		c.logger.Debug("websocket write error", "err", err)
 	}
