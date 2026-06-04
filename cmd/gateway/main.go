@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -88,18 +87,6 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-
-	_, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:      "REPLIES",
-		Subjects:  []string{"_reply.>"},
-		Retention: jetstream.LimitsPolicy,
-		MaxAge:    5 * time.Minute,
-		Storage:   jetstream.MemoryStorage,
-	})
-	if err != nil {
-		return fmt.Errorf("create REPLIES stream: %w", err)
-	}
-	logger.Info("REPLIES stream ready")
 
 	authMW := auth.Middleware(apiKey, verifier, logger)
 	srv := server.New(nc, js, authMW, logger)
