@@ -278,12 +278,14 @@ func (s *Server) subscribe(w http.ResponseWriter, r *http.Request) {
 // --- JetStream Streams ---
 
 type createStreamRequest struct {
-	Name          string   `json:"name"`
-	Subjects      []string `json:"subjects"`
-	Retention     string   `json:"retention,omitempty"`
-	MaxAgeSeconds int      `json:"max_age_seconds,omitempty"`
-	MaxBytes      int64    `json:"max_bytes,omitempty"`
-	MaxMsgs       int64    `json:"max_msgs,omitempty"`
+	Name              string   `json:"name"`
+	Subjects          []string `json:"subjects"`
+	Retention         string   `json:"retention,omitempty"`
+	MaxAgeSeconds     int      `json:"max_age_seconds,omitempty"`
+	MaxBytes          int64    `json:"max_bytes,omitempty"`
+	MaxMsgs           int64    `json:"max_msgs,omitempty"`
+	MaxMsgsPerSubject int64    `json:"max_msgs_per_subject,omitempty"`
+	Discard           string   `json:"discard,omitempty"`
 }
 
 type streamInfoResponse struct {
@@ -331,6 +333,18 @@ func (s *Server) createStream(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.MaxMsgs > 0 {
 		cfg.MaxMsgs = req.MaxMsgs
+	}
+	// MaxMsgsPerSubject bounds the buffer per subject — the useful knob for a
+	// durable broadcast stream where each subject is an independent topic.
+	if req.MaxMsgsPerSubject > 0 {
+		cfg.MaxMsgsPerSubject = req.MaxMsgsPerSubject
+	}
+	// DiscardOld (default) drops the oldest messages when a limit is hit, so the
+	// stream behaves as a bounded ring buffer. DiscardNew rejects new writes.
+	if req.Discard == "new" {
+		cfg.Discard = jetstream.DiscardNew
+	} else {
+		cfg.Discard = jetstream.DiscardOld
 	}
 
 	stream, err := s.js.CreateOrUpdateStream(r.Context(), cfg)

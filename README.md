@@ -263,6 +263,31 @@ websocat "wss://chitchat.miren.garden/v1/ws" \
 
 All subscriptions are automatically cleaned up when the WebSocket connection closes.
 
+#### Durable subscriptions
+
+By default a `subscribe` is a plain core NATS subscription: at-most-once, live-only, no replay. Add a **`session_id`** to make it durable, backed by JetStream:
+
+```json
+{"action": "subscribe", "subject": "announce.>", "session_id": "billing-svc"}
+```
+
+Response: `{"type": "subscribed", "subject": "announce.>", "session_id": "billing-svc"}`
+
+When `session_id` is present, the gateway binds a **durable consumer** keyed on `(session_id, subject)` to the stream that captures the subject. This gives you:
+
+- **Catch-up on connect** — a new session receives everything still retained in the stream buffer for that subject, not just messages sent after it connected.
+- **Resume on reconnect** — reconnect with the same `session_id` and you pick up exactly where you left off. Messages are acked only after a successful write to your socket, so a drop mid-stream redelivers rather than loses.
+- **Independent cursors** — each distinct `session_id` gets its own copy of every message (broadcast fan-out). Two connections sharing a `session_id` for the same subject is undefined — give every logical subscriber its own id.
+
+Requirements and notes:
+
+- **A stream must already capture the subject.** The stream *is* the durable buffer; size it with `max_msgs_per_subject` (see [Create or Update a Stream](#create-or-update-a-stream)). Subscribing with a `session_id` to a subject no stream captures returns an error.
+- **Messages older than the buffer are gone.** If a session is offline long enough that retained messages age or fall out of a bounded buffer, those are skipped — the bound is the tradeoff. Size the buffer for your worst-case offline window.
+- **Abandoned sessions are reclaimed.** A durable consumer with no connection bound for 24h is cleaned up automatically; a session returning after that gets a fresh consumer that replays whatever is still buffered.
+- Omit `session_id` and the behavior is exactly the old core-NATS subscription — nothing changes for existing clients.
+
+`unsubscribe` stops delivery but keeps the durable cursor so the session can resume later; the cursor is only reclaimed by the inactivity timeout above.
+
 #### Keepalives & reconnection
 
 The gateway runs an application-level keepalive on every WebSocket connection. Clients must cooperate or they will be disconnected.
@@ -321,6 +346,10 @@ POST /v1/streams
 - `max_age_seconds` — auto-delete messages older than this
 - `max_bytes` — cap total stream size
 - `max_msgs` — cap total message count
+- `max_msgs_per_subject` — cap messages **per subject** (the useful knob for a durable broadcast buffer, where each subject is an independent topic — e.g. keep the last 100 per subject)
+- `discard` — `"old"` (default) drops the oldest messages when a limit is hit, so the stream is a bounded ring buffer; `"new"` rejects new writes once full
+
+To make a bounded durable-broadcast buffer, create a `limits` stream over your broadcast subjects with `max_msgs_per_subject` set. Subscribers then opt into durability per-connection with a `session_id` (see [Durable subscriptions](#durable-subscriptions)).
 
 Response:
 
@@ -521,5 +550,6 @@ To decode: `echo 'eyJpZCI6IDEyM30=' | base64 -d` → `{"id": 123}`
 ## Delivery Guarantees
 
 - **Publish/Subscribe** (no stream): at-most-once. If no subscriber is listening, the message is dropped.
+- **Durable WebSocket subscriptions** (`session_id`, with a capturing stream): at-least-once for as long as the message is retained in the stream buffer. The session catches up on connect and resumes from its last ack on reconnect. Messages that age out of the buffer before the session reads them are skipped.
 - **JetStream streams**: at-least-once with explicit ack. Unacknowledged messages are redelivered after 5 minutes. If the gateway restarts, all pending acks are lost and those messages will be redelivered by NATS.
 - **Workqueue retention**: each message is delivered to exactly one consumer (at-least-once within that consumer).
