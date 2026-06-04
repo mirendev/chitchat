@@ -263,6 +263,37 @@ websocat "wss://chitchat.miren.garden/v1/ws" \
 
 All subscriptions are automatically cleaned up when the WebSocket connection closes.
 
+#### Keepalives & reconnection
+
+The gateway runs an application-level keepalive on every WebSocket connection. Clients must cooperate or they will be disconnected.
+
+**What the server does:**
+
+- Sends a **ping every ~54 seconds**.
+- Expects a **pong (or any frame) within 60 seconds**. If nothing arrives, the connection is considered dead and is closed, and its subscriptions are cleaned up.
+- Enforces a **10-second write deadline** on each message it sends, so a stalled reader can't wedge the server.
+
+**What clients must do:**
+
+- **Respond to pings with pongs.** Most WebSocket libraries do this automatically (e.g. gorilla/websocket, browser `WebSocket`, `websocat`). If yours doesn't, send a pong control frame in reply to each ping.
+- **Detect a dead gateway.** Set your own read deadline (refresh it on every pong and inbound frame) and send your own pings on an interval shorter than the deadline. This lets you notice an intermediary (load balancer, NAT) that has silently dropped the connection without a close frame — otherwise a TCP-level half-open connection can look alive while no messages flow.
+- **Reconnect and resubscribe.** Subscriptions do **not** survive a dropped connection. On reconnect, redial and re-send every `subscribe` action. Use exponential backoff so a gateway restart doesn't cause a reconnect storm.
+
+Recommended client settings (matching the server):
+
+| Setting | Value |
+| --- | --- |
+| Ping interval | ~30–54s |
+| Read deadline (pong wait) | 60s |
+| Write deadline | 10s |
+| Reconnect backoff | 1s → 30s, exponential |
+
+**Wait for `subscribed` before relying on a subscription.** The gateway registers the subscription with NATS and confirms it has taken effect *before* sending the `{"type":"subscribed"}` reply. If you publish (or signal another service to publish) before receiving that confirmation, messages can be missed. Always wait for `subscribed`.
+
+**Messages published while disconnected are lost.** Plain pub/sub is at-most-once (see [Delivery Guarantees](#delivery-guarantees)). Reconnecting resubscribes you for *future* messages but does not replay what was sent during the gap. If you need catch-up, use a JetStream stream and a durable consumer instead.
+
+The bundled `announce` and `pipe` clients implement all of the above (keepalive ping/pong, deadlines, and auto-reconnect with resubscribe) and are good reference implementations.
+
 ---
 
 ### Create or Update a Stream
