@@ -262,6 +262,15 @@ func (s *Server) subscribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Flush so the SUB reaches the server before the stream is considered live;
+	// otherwise messages published right after connect race ahead of the
+	// registered interest and are dropped by core NATS.
+	if err := s.nc.Flush(); err != nil {
+		s.logger.Error("subscribe flush failed", "subject", subject, "err", err)
+		sub.Unsubscribe()
+		return
+	}
+
 	<-r.Context().Done()
 	sub.Unsubscribe()
 }

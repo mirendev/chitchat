@@ -134,6 +134,15 @@ func (c *wsConn) handleSubscribe(msg wsInbound) {
 		return
 	}
 
+	// Flush so the SUB has reached the server before we confirm. Otherwise the
+	// "subscribed" ack races ahead of the registered interest and messages
+	// published in that window are silently dropped by core NATS.
+	if err := c.server.nc.Flush(); err != nil {
+		sub.Unsubscribe()
+		c.send(wsOutbound{Type: "error", Error: "subscribe flush failed: " + err.Error()})
+		return
+	}
+
 	c.mu.Lock()
 	c.subs[msg.Subject] = sub
 	c.mu.Unlock()
