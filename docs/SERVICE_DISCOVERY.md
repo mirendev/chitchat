@@ -395,12 +395,23 @@ possible future enhancement, not part of this convention today.
 
 ## Security & trust
 
-The catalog is **self-asserted**. Any holder of a valid bearer token can publish a descriptor
-claiming to be any service, and can subscribe to any RPC subject and answer first. The gateway
-authenticates the *connection* (API key or multipass JWT) but has **no per-service
-authorization** — it won't stop one service from impersonating another within the same trust
-domain. Treat the catalog as **advisory**, not a security boundary: use it to discover and route,
-not to make authorization decisions.
+The descriptor *body* is **self-asserted**. Any holder of a valid bearer token can publish a
+descriptor whose `service`/`instance` fields claim to be any service, and can subscribe to any
+RPC subject and answer first. The gateway has **no per-service authorization** — it won't stop
+one service from impersonating another within the same trust domain.
+
+However, the *transport* now attributes every descriptor. The gateway stamps a **verified
+publisher identity** onto every message — `cc-id` / `cc-auth` (and `cc-email` / `cc-sub` for
+multipass JWTs) — and strips any client-supplied copy, so these headers are unspoofable (see the
+[Authentication](../README.md#authentication) section). Those headers ride with each descriptor
+and are preserved across JetStream replay, so a discoverer can read them and **cross-check the
+claimed `service` against the authenticated principal that actually published it** — a basic
+anti-impersonation signal.
+
+Still, treat the catalog as **advisory**: identity is now *attributable*, but there is no
+per-service authz enforcing that "only principal X may advertise service Y." Use the catalog to
+discover and route; make authorization decisions from the verified identity, not the descriptor
+body.
 
 ---
 
@@ -413,7 +424,7 @@ not to make authorization decisions.
 | Durable-resume gap | A reused `session_id` gets only post-ack changes; prefer a fresh `session_id` per boot for a full snapshot. |
 | Descriptor size vs payload limit | NATS `max_payload` is 1 MB and applies to the stored descriptor too. Keep descriptors well under it. If schemas are large, keep them thin and expose a `<service>.schema` RPC that returns the full schema on demand, or put a schema URL in `metadata`. |
 | Subject token collisions | `<service>`/`<instance>` must be single tokens; a `.` reshapes the tree and breaks the per-instance catalog slot. Sanitize at the service. |
-| Trust | Advertisements are unauthenticated self-claims behind one shared token; no per-service authz. Advisory only. |
+| Trust | Descriptor *bodies* are self-claims; no per-service authz. But the gateway stamps a verified, unspoofable publisher identity (`cc-*`) on every descriptor, so the publisher is *attributable* — cross-check the claimed `service` against it. Advisory, not an authz boundary. |
 | One `session_id` per discoverer | Two connections sharing a `session_id` for the same subject is undefined — give every logical discoverer its own id. |
 | Gateway restart | Pending acks are lost on restart, so a discoverer may receive a duplicate descriptor — harmless, since descriptors are idempotent soft state. |
 | `DISCOVERY` stream is gateway-managed | Auto-provisioned on startup; don't hand-create or delete it. Tune only via `DISCOVERY_MAX_AGE_SECONDS`. |

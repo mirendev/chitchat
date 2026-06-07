@@ -16,6 +16,8 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+
+	"miren.dev/chitchat/internal/auth"
 )
 
 const (
@@ -68,6 +70,13 @@ type wsOutbound struct {
 	ReplySubject string            `json:"reply_subject,omitempty"`
 	SessionID    string            `json:"session_id,omitempty"`
 	Count        int               `json:"count,omitempty"`
+
+	// whoami response fields. WhoSubject carries the JWT `sub` claim under a
+	// distinct key — Subject above already means the NATS subject.
+	Identity   string `json:"identity,omitempty"`
+	Auth       string `json:"auth,omitempty"`
+	Email      string `json:"email,omitempty"`
+	WhoSubject string `json:"who_subject,omitempty"`
 }
 
 func (s *Server) websocketHandler(w http.ResponseWriter, r *http.Request) {
@@ -77,6 +86,11 @@ func (s *Server) websocketHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Capture the verified identity from the (authenticated) upgrade request
+	// before we switch to a background context. WS actions aren't re-authed, so
+	// this principal is reused for every publish on the connection.
+	principal, _ := auth.FromContext(r.Context())
+
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &wsConn{
 		conn:        conn,
@@ -84,6 +98,7 @@ func (s *Server) websocketHandler(w http.ResponseWriter, r *http.Request) {
 		logger:      s.logger,
 		ctx:         ctx,
 		cancel:      cancel,
+		principal:   principal,
 		subs:        make(map[string]*nats.Subscription),
 		jsConsumers: make(map[string]*jsSub),
 	}
@@ -103,6 +118,8 @@ type wsConn struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	principal *auth.Principal // verified identity, captured at upgrade
 
 	writeMu     sync.Mutex
 	mu          sync.Mutex
@@ -164,6 +181,8 @@ func (c *wsConn) run() {
 			c.handleUnsubscribe(msg)
 		case "teardown":
 			c.handleTeardown(msg)
+		case "whoami":
+			c.handleWhoami()
 		case "publish":
 			c.handlePublish(msg)
 		default:
@@ -461,12 +480,7 @@ func (c *wsConn) handlePublish(msg wsInbound) {
 		Subject: msg.Subject,
 		Data:    data,
 		Reply:   msg.ReplySubject,
-	}
-	if len(msg.Headers) > 0 {
-		m.Header = make(nats.Header)
-		for k, v := range msg.Headers {
-			m.Header.Set(k, v)
-		}
+		Header:  buildStampedHeader(msg.Headers, c.principal),
 	}
 
 	if err := c.server.nc.PublishMsg(m); err != nil {
@@ -475,6 +489,20 @@ func (c *wsConn) handlePublish(msg wsInbound) {
 	}
 
 	c.send(wsOutbound{Type: "published", Subject: msg.Subject})
+}
+
+// handleWhoami reports the connection's verified identity. Strictly
+// request/response — never sent unsolicited, so it can't preempt the
+// "subscribed" ack that clients read as their first frame.
+func (c *wsConn) handleWhoami() {
+	out := wsOutbound{Type: "whoami"}
+	if c.principal != nil {
+		out.Identity = c.principal.Identity
+		out.Auth = c.principal.Method
+		out.Email = c.principal.Email
+		out.WhoSubject = c.principal.Subject
+	}
+	c.send(out)
 }
 
 func (c *wsConn) pingLoop(done <-chan struct{}) {

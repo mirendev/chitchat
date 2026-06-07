@@ -14,6 +14,8 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+
+	"miren.dev/chitchat/internal/auth"
 )
 
 type Server struct {
@@ -50,6 +52,8 @@ func (s *Server) Handler() http.Handler {
 	v1 := r.PathPrefix("/v1").Subrouter()
 	v1.Use(mux.MiddlewareFunc(s.authMW))
 
+	v1.HandleFunc("/whoami", s.whoami).Methods(http.MethodGet)
+
 	v1.HandleFunc("/publish", s.publish).Methods(http.MethodPost)
 	v1.HandleFunc("/request", s.request).Methods(http.MethodPost)
 	v1.HandleFunc("/subscribe", s.subscribe).Methods(http.MethodGet)
@@ -82,6 +86,32 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	w.Write([]byte("ok"))
 }
 
+// --- Identity ---
+
+type whoamiResponse struct {
+	Identity string `json:"identity"`
+	Auth     string `json:"auth"`
+	Email    string `json:"email,omitempty"`
+	Subject  string `json:"subject,omitempty"`
+}
+
+// whoami reports the verified identity the gateway sees for the caller.
+func (s *Server) whoami(w http.ResponseWriter, r *http.Request) {
+	p, ok := auth.FromContext(r.Context())
+	if !ok || p == nil {
+		// Should not happen inside /v1 (auth middleware always sets a principal),
+		// but fail safe rather than panic.
+		writeJSON(w, http.StatusOK, whoamiResponse{})
+		return
+	}
+	writeJSON(w, http.StatusOK, whoamiResponse{
+		Identity: p.Identity,
+		Auth:     p.Method,
+		Email:    p.Email,
+		Subject:  p.Subject,
+	})
+}
+
 // --- Core Messaging ---
 
 type publishRequest struct {
@@ -107,15 +137,11 @@ func (s *Server) publish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	p, _ := auth.FromContext(r.Context())
 	msg := &nats.Msg{
 		Subject: req.Subject,
 		Data:    data,
-	}
-	if len(req.Headers) > 0 {
-		msg.Header = make(nats.Header)
-		for k, v := range req.Headers {
-			msg.Header.Set(k, v)
-		}
+		Header:  buildStampedHeader(req.Headers, p),
 	}
 
 	if err := s.nc.PublishMsg(msg); err != nil {
@@ -164,16 +190,12 @@ func (s *Server) request(w http.ResponseWriter, r *http.Request) {
 
 	replySubject := "_reply." + generateAckID()
 
+	p, _ := auth.FromContext(r.Context())
 	msg := &nats.Msg{
 		Subject: req.Subject,
 		Reply:   replySubject,
 		Data:    data,
-	}
-	if len(req.Headers) > 0 {
-		msg.Header = make(nats.Header)
-		for k, v := range req.Headers {
-			msg.Header.Set(k, v)
-		}
+		Header:  buildStampedHeader(req.Headers, p),
 	}
 
 	// Subscribe to the reply subject before publishing so we don't miss it.

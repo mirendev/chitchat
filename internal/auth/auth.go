@@ -14,6 +14,17 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
+// Auth methods, used as the value of Principal.Method and the
+// cc-auth header.
+const (
+	MethodJWT    = "jwt"
+	MethodAPIKey = "apikey"
+
+	// APIKeyIdentity is the identity stamped for callers authenticated with the
+	// shared API key (which carries no per-principal identity of its own).
+	APIKeyIdentity = "apikey"
+)
+
 // Claims is the subset of multipass JWT claims we consume.
 type Claims struct {
 	jwt.RegisteredClaims
@@ -28,12 +39,22 @@ func (c *Claims) Identity() string {
 	return c.Subject
 }
 
+// Principal is the verified identity of the current caller, derived from
+// whichever auth method succeeded. It is what the gateway stamps onto outbound
+// messages and reports via /v1/whoami.
+type Principal struct {
+	Method   string // MethodJWT or MethodAPIKey
+	Identity string // canonical identity: email else subject (JWT), or "apikey"
+	Email    string // JWT only, when present
+	Subject  string // JWT only, when present
+}
+
 type ctxKey struct{}
 
-// FromContext returns the verified claims for the current request, if any.
-func FromContext(ctx context.Context) (*Claims, bool) {
-	c, ok := ctx.Value(ctxKey{}).(*Claims)
-	return c, ok
+// FromContext returns the verified principal for the current request, if any.
+func FromContext(ctx context.Context) (*Principal, bool) {
+	p, ok := ctx.Value(ctxKey{}).(*Principal)
+	return p, ok
 }
 
 // Middleware accepts either a static API key or a multipass JWT (if configured).
@@ -62,7 +83,9 @@ func Middleware(apiKey string, verifier *Verifier, logger *slog.Logger) func(htt
 
 			// Try static API key first.
 			if subtle.ConstantTimeCompare([]byte(token), keyBytes) == 1 {
-				next.ServeHTTP(w, r)
+				p := &Principal{Method: MethodAPIKey, Identity: APIKeyIdentity}
+				ctx := context.WithValue(r.Context(), ctxKey{}, p)
+				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
 
@@ -74,7 +97,13 @@ func Middleware(apiKey string, verifier *Verifier, logger *slog.Logger) func(htt
 					writeError(w, http.StatusUnauthorized, "invalid token")
 					return
 				}
-				ctx := context.WithValue(r.Context(), ctxKey{}, claims)
+				p := &Principal{
+					Method:   MethodJWT,
+					Identity: claims.Identity(),
+					Email:    claims.Email,
+					Subject:  claims.Subject,
+				}
+				ctx := context.WithValue(r.Context(), ctxKey{}, p)
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}

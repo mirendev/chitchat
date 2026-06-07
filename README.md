@@ -41,6 +41,29 @@ When both are configured, each request is checked against the API key first, the
 
 The `/healthz` endpoint is unauthenticated. For WebSocket connections, pass the token via `?token=` query parameter or `Authorization` header.
 
+### Ambient identity
+
+The gateway makes the caller's verified identity an **ambient property**. On every message a caller sends (`publish`, `request`, WS `publish`), the gateway stamps these headers:
+
+| Header | Value |
+| --- | --- |
+| `cc-id` | Canonical identity: the JWT email (else its subject), or `apikey` for API-key callers |
+| `cc-auth` | `jwt` or `apikey` |
+| `cc-email` | The JWT email, when present |
+| `cc-sub` | The JWT subject (`sub`), when present |
+
+The names are deliberately short — they ride on every message. Recipients read them from the message `headers` on any receive path (SSE, WebSocket, durable subscription, pull) to learn who sent a message — including who answered a request-reply, since the reply is stamped too.
+
+**These headers are unspoofable.** The `cc-` prefix is reserved: the gateway strips any client-supplied `cc-*` header (in any casing) before stamping its own, and NATS is reachable only through the gateway — so a caller cannot assert an identity that isn't theirs.
+
+To ask the gateway for your own identity:
+
+```
+GET /v1/whoami        ->  {"identity":"alice@example.com","auth":"jwt","email":"alice@example.com","subject":"user-123"}
+```
+
+Over a WebSocket, send `{"action":"whoami"}` and receive `{"type":"whoami","identity":"…","auth":"…","email":"…","who_subject":"…"}`.
+
 ## API Reference
 
 ### Health Check
