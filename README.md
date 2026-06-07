@@ -30,11 +30,17 @@ Enable by setting `MULTIPASS_BASE_URL` to your multipass instance (e.g. `https:/
 Authorization: Bearer <multipass-jwt>
 ```
 
-Optionally set `ALLOWED_DOMAIN` (e.g. `miren.dev`) to restrict access to users with matching email addresses.
+Optionally restrict which verified identities are accepted:
+
+- `ALLOWED_DOMAIN` (e.g. `miren.dev`) — restricts identities that are **email addresses** to this domain.
+- `ALLOWED_PREFIXES` (comma-separated) — admits **non-email service identities** whose email/subject starts with one of these prefixes (e.g. `org:org-Miren-P20syIg0MAcS:`). Service/workload tokens (like a cluster agent) have a structured identity with no `@`, so they're allowed via a prefix rather than the domain.
+
+A token is accepted if its identity matches `ALLOWED_DOMAIN` **or** any `ALLOWED_PREFIXES` entry. With neither set, any signature-valid multipass token is accepted.
 
 ```bash
 miren env set -C garden -a chitchat MULTIPASS_BASE_URL=https://multipass.miren.cloud
 miren env set -C garden -a chitchat ALLOWED_DOMAIN=miren.dev
+miren env set -C garden -a chitchat ALLOWED_PREFIXES=org:org-Miren-P20syIg0MAcS:
 ```
 
 When both are configured, each request is checked against the API key first, then falls back to JWT verification.

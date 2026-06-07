@@ -35,7 +35,11 @@ description = "Optional. Set to enable multipass JWT auth (e.g. https://multipas
 
 [[env]]
 key = "ALLOWED_DOMAIN"
-description = "Optional. Restrict multipass JWTs to this email domain (e.g. miren.dev)"
+description = "Optional. Restrict multipass JWTs whose identity is an email to this domain (e.g. miren.dev)"
+
+[[env]]
+key = "ALLOWED_PREFIXES"
+description = "Optional, comma-separated. Admit non-email service identities whose email/subject starts with one of these prefixes (e.g. org:org-Miren-P20syIg0MAcS:). A token passes if it matches ALLOWED_DOMAIN OR a prefix."
 
 [[env]]
 key = "DISCOVERY_MAX_AGE_SECONDS"

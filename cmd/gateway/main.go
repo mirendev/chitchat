@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -46,12 +47,13 @@ func run(logger *slog.Logger) error {
 	var verifier *auth.Verifier
 	if multipassURL := os.Getenv("MULTIPASS_BASE_URL"); multipassURL != "" {
 		allowedDomain := os.Getenv("ALLOWED_DOMAIN")
-		v, err := auth.NewVerifier(ctx, multipassURL, allowedDomain)
+		allowedPrefixes := splitCSV(os.Getenv("ALLOWED_PREFIXES"))
+		v, err := auth.NewVerifier(ctx, multipassURL, allowedDomain, allowedPrefixes)
 		if err != nil {
 			return err
 		}
 		verifier = v
-		logger.Info("multipass auth enabled", "url", multipassURL, "domain", allowedDomain)
+		logger.Info("multipass auth enabled", "url", multipassURL, "domain", allowedDomain, "prefixes", allowedPrefixes)
 	}
 
 	logger.Info("connecting to nats", "url", natsURL)
@@ -131,6 +133,17 @@ func run(logger *slog.Logger) error {
 // keeps the latest descriptor per instance (last-known-state), and MaxAge ages
 // out instances that stop heartbeating. CreateOrUpdateStream is idempotent, so
 // this is safe on every startup and redeploy.
+// splitCSV parses a comma-separated env value into a trimmed, non-empty list.
+func splitCSV(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func ensureDiscoveryStream(ctx context.Context, js jetstream.JetStream, logger *slog.Logger) error {
 	maxAge := 120 * time.Second
 	if v := os.Getenv("DISCOVERY_MAX_AGE_SECONDS"); v != "" {

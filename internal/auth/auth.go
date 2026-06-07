@@ -115,20 +115,26 @@ func Middleware(apiKey string, verifier *Verifier, logger *slog.Logger) func(htt
 
 // Verifier holds a cached JWKS for verifying multipass-issued JWTs.
 type Verifier struct {
-	keys          keyfunc.Keyfunc
-	allowedDomain string
+	keys            keyfunc.Keyfunc
+	allowedDomain   string
+	allowedPrefixes []string
 }
 
 // NewVerifier fetches the JWKS at <multipassBaseURL>/.well-known/jwks.json
-// and returns a Verifier with periodic auto-refresh. If allowedDomain is
-// non-empty, emails must match it.
-func NewVerifier(ctx context.Context, multipassBaseURL, allowedDomain string) (*Verifier, error) {
+// and returns a Verifier with periodic auto-refresh.
+//
+// Authorization (when any restriction is configured): a token is accepted if its
+// email is in allowedDomain, OR its email/subject starts with one of
+// allowedPrefixes. The prefix list is how non-email service identities (e.g.
+// "org:org-Miren-...:app:clusteragent:...") are admitted, since they have no
+// @domain. With neither configured, all signature-valid tokens are accepted.
+func NewVerifier(ctx context.Context, multipassBaseURL, allowedDomain string, allowedPrefixes []string) (*Verifier, error) {
 	jwksURL := strings.TrimRight(multipassBaseURL, "/") + "/.well-known/jwks.json"
 	k, err := keyfunc.NewDefaultCtx(ctx, []string{jwksURL})
 	if err != nil {
 		return nil, fmt.Errorf("fetch jwks at %s: %w", jwksURL, err)
 	}
-	return &Verifier{keys: k, allowedDomain: allowedDomain}, nil
+	return &Verifier{keys: k, allowedDomain: allowedDomain, allowedPrefixes: allowedPrefixes}, nil
 }
 
 // Verify parses and verifies a Bearer JWT. Returns claims on success.
@@ -143,12 +149,35 @@ func (v *Verifier) Verify(tokenStr string) (*Claims, error) {
 	if !tok.Valid {
 		return nil, errors.New("invalid token")
 	}
-	if v.allowedDomain != "" && claims.Email != "" {
-		if !strings.HasSuffix(strings.ToLower(claims.Email), "@"+strings.ToLower(v.allowedDomain)) {
-			return nil, fmt.Errorf("email %s not in allowed domain %s", claims.Email, v.allowedDomain)
-		}
+	if err := v.authorize(claims.Email, claims.Subject); err != nil {
+		return nil, err
 	}
 	return &claims, nil
+}
+
+// authorize applies the domain / prefix allowlist. Pure (no crypto) so it can be
+// unit-tested directly.
+func (v *Verifier) authorize(email, subject string) error {
+	// No restrictions configured: any signature-valid token is allowed.
+	if v.allowedDomain == "" && len(v.allowedPrefixes) == 0 {
+		return nil
+	}
+	// Email in the allowed domain (human users).
+	if v.allowedDomain != "" && strings.Contains(email, "@") &&
+		strings.HasSuffix(strings.ToLower(email), "@"+strings.ToLower(v.allowedDomain)) {
+		return nil
+	}
+	// Identity matches an allowed prefix (service/workload identities).
+	for _, p := range v.allowedPrefixes {
+		if p != "" && (strings.HasPrefix(email, p) || strings.HasPrefix(subject, p)) {
+			return nil
+		}
+	}
+	id := email
+	if id == "" {
+		id = subject
+	}
+	return fmt.Errorf("identity %q not allowed (domain=%q, prefixes=%v)", id, v.allowedDomain, v.allowedPrefixes)
 }
 
 func writeError(w http.ResponseWriter, code int, msg string) {
