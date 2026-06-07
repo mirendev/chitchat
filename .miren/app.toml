@@ -36,3 +36,7 @@ description = "Optional. Set to enable multipass JWT auth (e.g. https://multipas
 [[env]]
 key = "ALLOWED_DOMAIN"
 description = "Optional. Restrict multipass JWTs to this email domain (e.g. miren.dev)"
+
+[[env]]
+key = "DISCOVERY_MAX_AGE_SECONDS"
+description = "Optional. Seconds a service descriptor is retained in the DISCOVERY stream before aging out (default 120). Must exceed services' heartbeat interval and ttl_seconds. See docs/SERVICE_DISCOVERY.md"

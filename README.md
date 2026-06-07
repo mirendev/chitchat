@@ -564,6 +564,10 @@ curl -X POST https://chitchat.miren.garden/v1/request \
 
 The responder receives the message with `reply_subject` and publishes the response to that subject. See the WebSocket request-reply example above for the full flow.
 
+### Service discovery
+
+For a convention where services **advertise themselves and their RPCs** (with JSON Schemas) so other services can discover and call them — built on these same primitives plus an auto-provisioned `DISCOVERY` stream — see [docs/SERVICE_DISCOVERY.md](docs/SERVICE_DISCOVERY.md).
+
 ## Architecture
 
 Chitchat is a single Miren app with two services:

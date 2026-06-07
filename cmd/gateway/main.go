@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -88,6 +90,10 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	if err := ensureDiscoveryStream(ctx, js, logger); err != nil {
+		return err
+	}
+
 	authMW := auth.Middleware(apiKey, verifier, logger)
 	srv := server.New(nc, js, authMW, logger)
 
@@ -117,4 +123,35 @@ func run(logger *slog.Logger) error {
 		defer cancel()
 		return httpSrv.Shutdown(shutdownCtx)
 	}
+}
+
+// ensureDiscoveryStream provisions the DISCOVERY stream that backs the service
+// discovery convention (see docs/SERVICE_DISCOVERY.md). Services heartbeat their
+// descriptors to discovery.service.<service>.<instance>; max_msgs_per_subject=1
+// keeps the latest descriptor per instance (last-known-state), and MaxAge ages
+// out instances that stop heartbeating. CreateOrUpdateStream is idempotent, so
+// this is safe on every startup and redeploy.
+func ensureDiscoveryStream(ctx context.Context, js jetstream.JetStream, logger *slog.Logger) error {
+	maxAge := 120 * time.Second
+	if v := os.Getenv("DISCOVERY_MAX_AGE_SECONDS"); v != "" {
+		secs, err := strconv.Atoi(v)
+		if err != nil || secs <= 0 {
+			return fmt.Errorf("invalid DISCOVERY_MAX_AGE_SECONDS %q: must be a positive integer", v)
+		}
+		maxAge = time.Duration(secs) * time.Second
+	}
+
+	_, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:              "DISCOVERY",
+		Subjects:          []string{"discovery.service.>"},
+		Retention:         jetstream.LimitsPolicy,
+		Discard:           jetstream.DiscardOld,
+		MaxMsgsPerSubject: 1,
+		MaxAge:            maxAge,
+	})
+	if err != nil {
+		return fmt.Errorf("create DISCOVERY stream: %w", err)
+	}
+	logger.Info("DISCOVERY stream ready", "max_age", maxAge)
+	return nil
 }
