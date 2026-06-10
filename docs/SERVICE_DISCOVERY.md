@@ -35,8 +35,9 @@ Everything below is layered on those. No special endpoints exist for discovery.
 | `discovery.service.<service>.<instance>` | service → | Each instance heartbeats its descriptor here. One subject per instance. |
 | `discovery.service.>` | ← discoverer | Subscribe for the whole catalog + live updates. |
 | `discovery.service.<service>.>` | ← discoverer | Watch a single service's instances. |
-| `<service>.<method>` | RPC caller → | The RPC request subject (any instance — see [fan-out](#multi-instance-rpcs--fan-out)). |
-| `<service>.<method>.<instance>` | RPC caller → | Optional per-instance subject to pin a specific instance. |
+| `<service>.<method>` | RPC caller → | Service-addressed RPC — any instance answers (see [fan-out](#multi-instance-rpcs--fan-out)). |
+| `<service>.<method>.<instance>` | RPC caller → | Instance-addressed RPC — pins one named instance. |
+| `<service>.<method>.<entity-id>` | RPC caller → | Entity-addressed RPC — routes to the one instance that hosts the entity (see [Entity-addressed RPCs](#entity-addressed-rpcs--placement)). |
 | `<service>.ping` | RPC caller → | Recommended health probe (see [Health checks](#health-checks)). |
 
 **Token rules.** `<service>` and `<instance>` must each be a single NATS subject token — no
@@ -45,6 +46,22 @@ silently reshapes the subject tree and breaks the per-instance catalog slot, so 
 the service side. `<instance>` must be **stable for the life of the process** (e.g. the Miren
 machine id, hostname, or a UUID generated once at boot) so its catalog slot is reused across
 heartbeats instead of creating a new entry each beat.
+
+### Addressing modes
+
+An RPC subject can target three different scopes, all built from that single-token rule:
+
+| Mode | Subject | Who subscribes | Use |
+|---|---|---|---|
+| **service** | `<service>.<method>` | any/all live instances (fan-out, first reply wins) | stateless / idempotent calls |
+| **instance** | `<service>.<method>.<instance>` | exactly one named instance | pin a specific process |
+| **entity** | `<service>.<method>.<entity-id>` | exactly the instance hosting that entity | address a *placed* entity |
+
+`<entity-id>` is itself a **single NATS token** of the form `<instance>:<local>` — note the `:`,
+**not** a `.`, so the whole id stays one token. Because the id embeds its host `<instance>`, the
+hosting instance is the only subscriber to that suffix, so a caller holding the id routes to it
+**directly, with no lookup** — the id *is* the route. See
+[Entity-addressed RPCs & placement](#entity-addressed-rpcs--placement) for the full pattern.
 
 **Reserved prefixes.** `_reply.*` is owned by the gateway (request-reply plumbing). The
 `discovery.>` subtree is owned by this convention — don't publish unrelated traffic there.
@@ -116,11 +133,20 @@ publish. Example:
 | `rpcs[].response_schema` | yes | JSON Schema for the success response body. |
 | `rpcs[].timeout_ms` | no | Suggested request timeout (default 5000). |
 | `rpcs[].description` | no | Human description. |
-| `rpcs[].pinned_subject` | no | Per-instance variant of `subject` (e.g. `geo.lookup.geo-1`) for callers that want to avoid fan-out. |
+| `rpcs[].addressing` | no | `"service"` (default), `"instance"`, or `"entity"` — see [Addressing modes](#addressing-modes). |
+| `rpcs[].subject_template` | no | For instance/entity RPCs, the routable subject with one `{instance}` or `{entity}` placeholder (e.g. `sandbox.exec.{entity}`). The caller substitutes the id. |
+| `rpcs[].entity_type` | no | For `addressing:"entity"`, the `entities[].type` this RPC targets. SHOULD be set, and `{entity}` SHOULD appear in `subject_template`. |
+| `rpcs[].pinned_subject` | no | Self-pin shorthand: the instance-addressed subject for *this* descriptor's own instance (e.g. `geo.lookup.geo-1`). Equivalent to `addressing:"instance"` + `subject_template:"<subject>.{instance}"`; new services should prefer that general form. |
+| `entities` | no | Entity *types* this service addresses by id — see [Entity-addressed RPCs & placement](#entity-addressed-rpcs--placement). Each: `type` (required, single token), `description`, `id_format`, `list_rpc`, `place_rpc` (the latter two name RPCs by their `name`). |
 | `version` | no | Service build/semver. |
 | `description` | no | Human description of the service. |
 | `events` | no | Pub/sub topics the service emits: `{name, subject, schema, description}`. |
 | `metadata` | no | Free-form key/value (region, machine id, docs URL, …). |
+
+For instance- and entity-addressed RPCs, `subject` is the un-suffixed *stem* (a stable name, and
+often the legacy "broadcast + owner answers" subject); `subject_template` is the form a caller
+actually routes with. All new fields are optional — a descriptor without them is valid and means
+every RPC is service-addressed.
 
 JSON Schemas are **embedded, self-contained objects** (draft 2020-12 recommended) — not `$ref`
 to external files, since there is no schema-hosting endpoint. If your schemas are large, see
@@ -151,11 +177,28 @@ to external files, since there is no schema-hosting endpoint. If your schemas ar
         "properties": {
           "name": { "type": "string" },
           "subject": { "type": "string" },
+          "addressing": { "enum": ["service", "instance", "entity"] },
+          "subject_template": { "type": "string" },
+          "entity_type": { "type": "string" },
           "pinned_subject": { "type": "string" },
           "description": { "type": "string" },
           "timeout_ms": { "type": "integer", "minimum": 1 },
           "request_schema": { "type": "object" },
           "response_schema": { "type": "object" }
+        }
+      }
+    },
+    "entities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["type"],
+        "properties": {
+          "type": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+          "description": { "type": "string" },
+          "id_format": { "type": "string" },
+          "list_rpc": { "type": "string" },
+          "place_rpc": { "type": "string" }
         }
       }
     },
@@ -278,6 +321,10 @@ rather than immediately. The discoverer should mirror the WebSocket client shape
 > **Reference implementation.** [`examples/discovery`](../examples/discovery) is a self-contained,
 > copy-from program that advertises a service and maintains the live catalog using exactly this
 > pattern. Run two copies and each one's catalog lists both instances.
+>
+> **CLI.** [`cmd/services`](../cmd/services) lists the advertised services from the catalog —
+> their RPCs, instances, and verified publisher. `services` for a one-shot list, `services -w`
+> to watch live, `services --json` for scripting.
 
 ---
 
@@ -307,6 +354,87 @@ listening) in addition to a `504` (instance reached but silent).
 
 To pin a specific instance (avoiding fan-out), call the RPC's `pinned_subject` if the descriptor
 provides one, e.g. `geo.lookup.geo-1`.
+
+---
+
+## Entity-addressed RPCs & placement
+
+Some services manage **entities** that live on a particular instance — e.g. `sandboxagent`'s
+*enclaves* and *sandboxes*, each placed on one agent process. An RPC can be addressed to a
+specific entity so it reaches exactly the instance that hosts it.
+
+### The pattern
+
+- **Subject:** `<service>.<method>.<entity-id>` (e.g. `sandbox.exec.a1:enc-mfrggzdf`).
+- **Entity id:** a single NATS token `<instance>:<local>` — `:` not `.`. The id **embeds its host
+  instance**, so the hosting instance is the only subscriber to that suffix.
+- **Routing is lookup-free.** A caller holding the id sends straight to the suffix; the id *is*
+  the route, so there's no registry to consult. And because exactly one instance subscribes, an
+  entity-addressed call has **no fan-out** — no duplicate side effects, no first-reply-wins.
+
+A service declares this in its descriptor: an `entities[]` entry for the type, and the relevant
+RPCs marked `addressing:"entity"` with a `subject_template`:
+
+```json
+{
+  "entities": [
+    { "type": "sandbox", "id_format": "<instance>:<local>", "list_rpc": "enclave.list", "place_rpc": "pool.place" }
+  ],
+  "rpcs": [
+    {
+      "name": "sandbox.exec",
+      "subject": "sandbox.exec",
+      "subject_template": "sandbox.exec.{entity}",
+      "addressing": "entity",
+      "entity_type": "sandbox",
+      "request_schema": { "type": "object", "required": ["cmd"] },
+      "response_schema": { "type": "object" }
+    }
+  ]
+}
+```
+
+A caller substitutes the id into the template (`strings.Replace(tmpl, "{entity}", id, 1)`) and
+calls the result like any RPC. Instance-addressed RPCs work the same way with `{instance}` and
+`addressing:"instance"`.
+
+**A dead entity answers immediately.** If you target `<service>.<method>.<instance>:<local>` whose
+host is gone, nothing is subscribed, so you get the `200` + empty body + `Status: 503` no-responders
+reply right away (not a timeout) — a natural "that entity isn't here" signal with no registry.
+
+### Finding entities and placing new ones
+
+Routing to a *known* entity needs nothing more than its id. Two things still need discovery, and
+both are **service-defined** (chitchat does not manage an entity catalog):
+
+- **Enumeration** — listing the entities that exist. Offer a service-addressed `list_rpc` that any
+  instance answers from its own replicated view, and name it in `entities[].list_rpc`.
+- **Placement** — deciding which instance a *new* entity should be created on. Offer a
+  service-addressed `place_rpc` that returns the chosen instance and the instance-addressed
+  "create" subject to call (e.g. `{ "instance": "a1", "create_subject": "enclave.create.a1" }`),
+  and name it in `entities[].place_rpc`.
+
+To keep enumeration/placement live, a service typically heartbeats each instance's entity inventory
+into **its own** bounded JetStream stream — the same shape as the service catalog: one subject per
+instance (`<service>.advertise.<instance>`), `max_msgs_per_subject:1`, `discard:old`, and
+`interval < ttl < max_age`. Instances durably subscribe to build an entity→instance registry that
+answers `list_rpc` / `place_rpc`. This stream, its payload, and the placement algorithm are
+entirely up to the service; the descriptor only *describes* them via `entities[]`.
+
+> **Reference.** `sandboxagent` implements exactly this: entity-addressed `sandbox.<op>.<fullID>`
+> and `enclave.{info,destroy}.<fullID>`; ids like `a1:enc-mfrggzdf`; a `SANDBOX_ADVERTISE` stream
+> fed by `sandbox.advertise.<agentID>`; and a `sandbox.pool.place` RPC returning the target agent
+> and its `enclave.create.<agent>` subject. [`examples/discovery`](../examples/discovery) shows a
+> minimal version (a `widget` entity with `widget.poke.{entity}`), and
+> [`cmd/services`](../cmd/services) displays entity-addressed RPCs and entity types.
+
+### Trust
+
+Entity ids and `entities[]` are **self-asserted** descriptor-body data, like `service`/`instance`.
+Route using the self-describing id, but make authorization decisions from the gateway-verified
+[`cc-*` identity headers](../README.md#ambient-identity) stamped on the entity-addressed request —
+not from the id the caller chose. Entity-addressed and advertisement messages carry those verified
+headers like any other, so the caller and the hosting instance are both attributable.
 
 ---
 
@@ -372,8 +500,10 @@ This is fine for read-only/idempotent RPCs and a problem for ones with side effe
 all convention-only (no gateway changes):
 
 - **Single owner.** Run exactly one instance per RPC subject, or have only one instance subscribe.
-- **Pinned subjects.** Advertise `pinned_subject` (`<service>.<method>.<instance>`) and have
-  callers target a specific instance.
+- **Instance- or entity-addressing.** Address a specific instance (`<service>.<method>.<instance>`)
+  or a placed entity (`<service>.<method>.<entity-id>`) — exactly one instance subscribes, so the
+  call is single-delivery by *routing*, no queue group needed. See
+  [Entity-addressed RPCs](#entity-addressed-rpcs--placement). (`pinned_subject` is the self-pin form.)
 - **Idempotent handlers.** Make the RPC safe to execute more than once (dedupe on a request id).
 - **Accept first-wins.** For read-only lookups, the wasted duplicate work is harmless.
 
@@ -424,6 +554,8 @@ body.
 | Durable-resume gap | A reused `session_id` gets only post-ack changes; prefer a fresh `session_id` per boot for a full snapshot. |
 | Descriptor size vs payload limit | NATS `max_payload` is 1 MB and applies to the stored descriptor too. Keep descriptors well under it. If schemas are large, keep them thin and expose a `<service>.schema` RPC that returns the full schema on demand, or put a schema URL in `metadata`. |
 | Subject token collisions | `<service>`/`<instance>` must be single tokens; a `.` reshapes the tree and breaks the per-instance catalog slot. Sanitize at the service. |
+| Entity-id token validity | An `<entity-id>` must stay a single NATS token — use `:` between `<instance>` and `<local>`, never `.`/`*`/`>`. A `.` splits the suffix onto a different subtree, the host never subscribes there, and the call lands nowhere. |
+| Targeting a dead entity | An entity-addressed call whose host is gone has no subscriber → immediate `200` + empty body + `Status: 503` (no-responders), not a timeout. Treat it as "entity not here." |
 | Trust | Descriptor *bodies* are self-claims; no per-service authz. But the gateway stamps a verified, unspoofable publisher identity (`cc-*`) on every descriptor, so the publisher is *attributable* — cross-check the claimed `service` against it. Advisory, not an authz boundary. |
 | One `session_id` per discoverer | Two connections sharing a `session_id` for the same subject is undefined — give every logical discoverer its own id. |
 | Gateway restart | Pending acks are lost on restart, so a discoverer may receive a duplicate descriptor — harmless, since descriptors are idempotent soft state. |

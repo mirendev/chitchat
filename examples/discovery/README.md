@@ -4,16 +4,29 @@ A self-contained, copy-from reference for the [service discovery
 convention](../../docs/SERVICE_DISCOVERY.md). Depends only on `gorilla/websocket`
 and the standard library, so you can lift whole functions into your own service.
 
-It does the two things every participating service needs:
+It does the things every participating service needs:
 
 - **`advertise()`** — heartbeats this process's descriptor into the catalog (`POST /v1/publish`).
+  The descriptor declares a service RPC (`echo`) and an **entity-addressed** RPC (`widget.poke`,
+  `subject_template: example.widget.poke.{entity}`) plus a `widget` entity type.
 - **`discover()`** — durably subscribes to the whole catalog with a **unique `session_id`** and
   keeps a live, TTL-expiring view of every service. The unique id is what makes it
   "all see all": each discoverer gets its own JetStream consumer and so receives every
   descriptor, instead of competing for them.
+- **`serveWidget()`** — serves one sample entity-addressed subject
+  (`example.widget.poke.<instance>:w1`). Because only this instance subscribes to that suffix, the
+  call routes directly here (see [entity-addressed RPCs](../../docs/SERVICE_DISCOVERY.md#entity-addressed-rpcs--placement)).
 
-`callRPC()` is included as reference for invoking a discovered RPC (it's not called by `main`,
-which only advertises + discovers).
+`callRPC()` is included as reference for invoking a discovered RPC, and `resolveEntity()` shows
+substituting an id into a `subject_template`.
+
+It also shows **verified-publisher** handling: the descriptor body (`service`/`instance`) is
+self-asserted, but the gateway stamps the publisher's verified identity onto the message headers
+(`cc-id` / `cc-auth`) and strips any client copy, so they're trustworthy
+([ambient identity](../../README.md#ambient-identity)). The catalog records each entry's verified
+publisher and runs a trust-on-first-use check — if a service is later advertised by a *different*
+verified identity, it's flagged as possible impersonation. Replace TOFU with your real policy
+(e.g. an allowlist of `service -> allowed identity`).
 
 ## Run it
 
@@ -35,6 +48,7 @@ Defaults: `CHITCHAT_URL=https://chitchat.miren.garden`, token from `multipass to
 |---|---|
 | Show your service in discovery | the `Descriptor`/`RPC`/`Event` structs + `advertise()` |
 | Consume the catalog | `discover()` + `runDiscover()` + the `catalog` type |
+| Trust who published a descriptor | read `cc-id`/`cc-auth` from the message headers (see `upsert` + the TOFU check) |
 | Call a service you discovered | `callRPC()` |
 
 Tune `serviceName`, `heartbeatInterval`, and `ttl` at the top of `main.go`. Keep

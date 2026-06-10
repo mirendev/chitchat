@@ -66,18 +66,35 @@ type Descriptor struct {
 	TTLSeconds       int               `json:"ttl_seconds"`
 	HeartbeatSeconds int               `json:"heartbeat_interval_seconds"`
 	RPCs             []RPC             `json:"rpcs"`
+	Entities         []Entity          `json:"entities,omitempty"`
 	Events           []Event           `json:"events,omitempty"`
 	Metadata         map[string]string `json:"metadata,omitempty"`
 }
 
 type RPC struct {
-	Name           string          `json:"name"`
-	Subject        string          `json:"subject"`
-	Description    string          `json:"description,omitempty"`
-	TimeoutMs      int             `json:"timeout_ms,omitempty"`
-	PinnedSubject  string          `json:"pinned_subject,omitempty"`
-	RequestSchema  json.RawMessage `json:"request_schema"`
-	ResponseSchema json.RawMessage `json:"response_schema"`
+	Name        string `json:"name"`
+	Subject     string `json:"subject"`
+	Description string `json:"description,omitempty"`
+	TimeoutMs   int    `json:"timeout_ms,omitempty"`
+	// Addressing is "service" (default), "instance", or "entity". For instance/
+	// entity RPCs, SubjectTemplate carries the routable form with a {instance} or
+	// {entity} placeholder; Subject is the un-suffixed stem.
+	Addressing      string          `json:"addressing,omitempty"`
+	SubjectTemplate string          `json:"subject_template,omitempty"`
+	EntityType      string          `json:"entity_type,omitempty"`
+	PinnedSubject   string          `json:"pinned_subject,omitempty"`
+	RequestSchema   json.RawMessage `json:"request_schema"`
+	ResponseSchema  json.RawMessage `json:"response_schema"`
+}
+
+// Entity declares a type of placed entity the service addresses by id. Placement
+// (which instance hosts which entity) is service-defined; this just describes it.
+type Entity struct {
+	Type        string `json:"type"`
+	Description string `json:"description,omitempty"`
+	IDFormat    string `json:"id_format,omitempty"`
+	ListRPC     string `json:"list_rpc,omitempty"`
+	PlaceRPC    string `json:"place_rpc,omitempty"`
 }
 
 type Event struct {
@@ -102,10 +119,22 @@ func main() {
 	defer stop()
 
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 	go func() { defer wg.Done(); advertise(ctx, cfg, instance) }()
 	go func() { defer wg.Done(); discover(ctx, cfg) }()
+	go func() { defer wg.Done(); serveWidget(ctx, cfg, instance) }()
 	wg.Wait()
+}
+
+// sampleWidget is the one entity id this example "hosts", so an entity-addressed
+// call resolves end-to-end without a real placement registry. The id is
+// self-describing: <instance>:<local>.
+func sampleWidget(instance string) string { return instance + ":w1" }
+
+// resolveEntity substitutes a known entity id into an RPC's subject_template.
+// Copy this to call entity-addressed RPCs you discover.
+func resolveEntity(subjectTemplate, entityID string) string {
+	return strings.Replace(subjectTemplate, "{entity}", entityID, 1)
 }
 
 // ===========================================================================
@@ -125,14 +154,36 @@ func advertise(ctx context.Context, cfg config, instance string) {
 		Description:      "Reference discovery example.",
 		TTLSeconds:       int(ttl.Seconds()),
 		HeartbeatSeconds: int(heartbeatInterval.Seconds()),
-		RPCs: []RPC{{
-			Name:           "echo",
-			Subject:        serviceName + ".echo",
-			Description:    "Echo the request payload back.",
-			TimeoutMs:      3000,
-			PinnedSubject:  serviceName + ".echo." + instance,
-			RequestSchema:  json.RawMessage(`{"type":"object","properties":{"msg":{"type":"string"}}}`),
-			ResponseSchema: json.RawMessage(`{"type":"object","properties":{"msg":{"type":"string"}}}`),
+		RPCs: []RPC{
+			{
+				Name:           "echo",
+				Subject:        serviceName + ".echo",
+				Description:    "Echo the request payload back.",
+				TimeoutMs:      3000,
+				PinnedSubject:  serviceName + ".echo." + instance,
+				RequestSchema:  json.RawMessage(`{"type":"object","properties":{"msg":{"type":"string"}}}`),
+				ResponseSchema: json.RawMessage(`{"type":"object","properties":{"msg":{"type":"string"}}}`),
+			},
+			{
+				// Entity-addressed: the caller substitutes a widget id (e.g.
+				// "<instance>:w1") into the template; only the hosting instance
+				// subscribes to that suffix, so it routes directly.
+				Name:            "widget.poke",
+				Subject:         serviceName + ".widget.poke", // un-suffixed stem
+				SubjectTemplate: serviceName + ".widget.poke.{entity}",
+				Addressing:      "entity",
+				EntityType:      "widget",
+				Description:     "Poke a specific widget.",
+				TimeoutMs:       3000,
+				RequestSchema:   json.RawMessage(`{"type":"object"}`),
+				ResponseSchema:  json.RawMessage(`{"type":"object","properties":{"poked":{"type":"string"}}}`),
+			},
+		},
+		Entities: []Entity{{
+			Type:        "widget",
+			Description: "A placed widget addressed by id.",
+			IDFormat:    "<instance>:<local>",
+			ListRPC:     "widget.list", // not implemented here; declared for shape
 		}},
 	}
 
@@ -154,6 +205,46 @@ func advertise(ctx context.Context, cfg config, instance string) {
 		case <-t.C:
 			beat()
 		}
+	}
+}
+
+// ===========================================================================
+// SERVE — handle an entity-addressed RPC for the one widget this instance hosts.
+// Only this instance subscribes to "<service>.widget.poke.<instance>:w1", so the
+// subject suffix routes the call directly here (exactly one subscriber).
+// ===========================================================================
+
+func serveWidget(ctx context.Context, cfg config, instance string) {
+	subject := resolveEntity(serviceName+".widget.poke.{entity}", sampleWidget(instance))
+
+	for ctx.Err() == nil {
+		conn, err := cfg.dial()
+		if err != nil {
+			time.Sleep(time.Second)
+			continue
+		}
+		go func() { <-ctx.Done(); conn.Close() }()
+		conn.WriteJSON(map[string]any{"action": "subscribe", "subject": subject})
+
+		for {
+			var m struct {
+				Type         string `json:"type"`
+				ReplySubject string `json:"reply_subject"`
+			}
+			if err := conn.ReadJSON(&m); err != nil {
+				break
+			}
+			if m.Type == "message" && m.ReplySubject != "" {
+				reply, _ := json.Marshal(map[string]string{"poked": sampleWidget(instance)})
+				conn.WriteJSON(map[string]any{
+					"action":  "publish",
+					"subject": m.ReplySubject,
+					"data":    base64.StdEncoding.EncodeToString(reply),
+				})
+			}
+		}
+		conn.Close()
+		time.Sleep(time.Second)
 	}
 }
 
@@ -254,10 +345,11 @@ func runDiscover(ctx context.Context, cfg config, sessionID string, cat *catalog
 
 	for {
 		var msg struct {
-			Type    string `json:"type"`
-			Subject string `json:"subject"`
-			Data    string `json:"data"`
-			Error   string `json:"error"`
+			Type    string            `json:"type"`
+			Subject string            `json:"subject"`
+			Data    string            `json:"data"`
+			Error   string            `json:"error"`
+			Headers map[string]string `json:"headers"`
 		}
 		if err := conn.ReadJSON(&msg); err != nil {
 			return err
@@ -278,7 +370,11 @@ func runDiscover(ctx context.Context, cfg config, sessionID string, cat *catalog
 			if err := json.Unmarshal(raw, &d); err != nil || d.SchemaVersion != 1 {
 				continue // ignore garbage / unknown schema versions
 			}
-			cat.upsert(d)
+			// The descriptor BODY (service/instance) is self-asserted, but the
+			// gateway stamps the publisher's VERIFIED identity onto the message
+			// headers (cc-id / cc-auth) and strips any client-supplied copy — so
+			// these are trustworthy. See ../../README.md#ambient-identity.
+			cat.upsert(d, msg.Headers["cc-id"], msg.Headers["cc-auth"])
 			cat.render()
 		}
 	}
@@ -292,19 +388,49 @@ func runDiscover(ctx context.Context, cfg config, sessionID string, cat *catalog
 type catalog struct {
 	mu    sync.Mutex
 	items map[string]catalogEntry // key: "service/instance"
+
+	// firstPublisher records the verified identity (cc-id) that first advertised
+	// each service name. It implements a trust-on-first-use (TOFU) check: if a
+	// later descriptor claims the same service from a DIFFERENT verified
+	// publisher, that's a possible impersonation. A real system would replace
+	// this with an explicit policy (an allowlist of service -> allowed
+	// identities); TOFU just shows how the verified header makes such a check
+	// possible at all.
+	firstPublisher map[string]string // service -> cc-id
 }
 
 type catalogEntry struct {
-	desc Descriptor
-	seen time.Time // when we last received a heartbeat for it
+	desc      Descriptor
+	seen      time.Time // when we last received a heartbeat for it
+	publisher string    // verified cc-id of whoever published this descriptor
+	auth      string    // verified cc-auth (jwt|apikey)
+	suspect   bool      // service claimed by a different publisher than first seen
 }
 
-func newCatalog() *catalog { return &catalog{items: map[string]catalogEntry{}} }
+func newCatalog() *catalog {
+	return &catalog{items: map[string]catalogEntry{}, firstPublisher: map[string]string{}}
+}
 
-func (c *catalog) upsert(d Descriptor) {
+func (c *catalog) upsert(d Descriptor, publisher, auth string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.items[d.Service+"/"+d.Instance] = catalogEntry{desc: d, seen: time.Now()}
+
+	// TOFU: remember the first verified publisher of each service; flag any
+	// later descriptor for that service that comes from a different identity.
+	suspect := false
+	if first, ok := c.firstPublisher[d.Service]; ok {
+		suspect = publisher != first
+	} else if publisher != "" {
+		c.firstPublisher[d.Service] = publisher
+	}
+
+	c.items[d.Service+"/"+d.Instance] = catalogEntry{
+		desc:      d,
+		seen:      time.Now(),
+		publisher: publisher,
+		auth:      auth,
+		suspect:   suspect,
+	}
 }
 
 // expire drops entries past their TTL; returns true if anything changed.
@@ -333,12 +459,25 @@ func (c *catalog) render() {
 	var b strings.Builder
 	fmt.Fprintf(&b, "\n=== catalog: %d instance(s) ===\n", len(keys))
 	for _, k := range keys {
-		d := c.items[k].desc
-		subs := make([]string, len(d.RPCs))
-		for i, r := range d.RPCs {
+		e := c.items[k]
+		subs := make([]string, len(e.desc.RPCs))
+		for i, r := range e.desc.RPCs {
 			subs[i] = r.Subject
 		}
-		fmt.Fprintf(&b, "  %-24s v%-8s rpcs=[%s]\n", k, d.Version, strings.Join(subs, ", "))
+		// Show the VERIFIED publisher (gateway-stamped), not the self-asserted
+		// service name, so impersonation is visible.
+		by := e.publisher
+		if by == "" {
+			by = "(unverified)"
+		} else {
+			by = fmt.Sprintf("%s/%s", by, e.auth)
+		}
+		flag := ""
+		if e.suspect {
+			flag = "  ⚠ IMPERSONATION? published by a different identity than this service was first seen with"
+		}
+		fmt.Fprintf(&b, "  %-24s v%-8s by %-28s rpcs=[%s]%s\n",
+			k, e.desc.Version, by, strings.Join(subs, ", "), flag)
 	}
 	fmt.Print(b.String())
 }
