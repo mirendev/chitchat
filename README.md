@@ -279,6 +279,59 @@ websocat "wss://chitchat.miren.garden/v1/ws" -H "Authorization: Bearer $KEY"
 # receives: {"type":"message","subject":"my-inbox.req1","data":"eyJsYXQiOiAzNy43fQ=="}
 ```
 
+#### Streaming responses
+
+Request-reply delivers exactly one reply. A **streaming request** delivers *many* frames
+followed by a terminal — for responses produced incrementally (LLM tokens, log tails, progress).
+It is **ephemeral**: built on core NATS, with no durability. If the requester disconnects
+mid-stream the rest is lost and it should re-request. The gateway manages the reply inbox, so the
+requester allocates **no subject and no session**.
+
+**Requester → gateway**
+
+```json
+{"action": "request_stream", "subject": "inference.messages.stream", "data": "<base64>", "headers": {…}}
+{"action": "cancel_stream", "stream_id": "cs_…"}
+```
+
+`request_stream` may carry a client-chosen `stream_id` (so the requester can register its handler
+before the first frame); the gateway generates one if omitted and echoes it on every frame. The
+gateway mints an ephemeral reply inbox, publishes the request to `subject` with that inbox as the
+reply, and acks with `stream_started`.
+
+**Gateway → requester**
+
+```json
+{"type": "stream_started", "stream_id": "cs_…"}
+{"type": "stream_chunk",   "stream_id": "cs_…", "data": "<base64>"}
+{"type": "stream_end",     "stream_id": "cs_…"}
+{"type": "stream_error",   "stream_id": "cs_…", "error": "…"}
+```
+
+`stream_end` / `stream_error` are terminal; the gateway then tears the stream down.
+
+**Responder → gateway** (the responder received an ordinary `message` whose `reply_subject` is the
+ephemeral inbox, plus a gateway-set `cc-stream-cancel` header):
+
+```json
+{"action": "stream_send", "subject": "<reply_subject>", "data": "<base64>"}
+{"action": "stream_end",  "subject": "<reply_subject>"}
+{"action": "stream_end",  "subject": "<reply_subject>", "error": "upstream 429"}
+```
+
+`stream_send` is one chunk; `stream_end` closes the stream (the gateway stamps the trusted,
+client-unspoofable `cc-stream-term` header, which is how the requester side knows a frame is
+terminal). Each chunk is its own NATS message, so every chunk is independently bounded by the 1 MB
+payload limit — keep chunks small.
+
+**Cancellation.** `cancel_stream` (or the requester simply disconnecting) makes the gateway publish
+to a per-stream cancel subject. A responder that subscribes to the `cc-stream-cancel` subject from
+the request headers learns of the cancel and can stop producing (e.g. abort an upstream call). The
+requester's stream is closed with a terminal `stream_end` either way.
+
+Backward compatible: the streaming actions are additive, so an older gateway answers an unknown
+`request_stream` with a generic `{"type":"error", …}` and clients can fall back.
+
 #### Example: pub/sub
 
 ```bash
