@@ -41,6 +41,17 @@ const (
 	// down by finding its consumers without parsing the (hashed) durable name.
 	sessionMetaKey        = "chitchat_session"
 	sessionMetaSubjectKey = "chitchat_subject"
+
+	// Streaming-response headers. All carry the reserved "cc-" prefix, so
+	// buildStampedHeader strips any client-supplied copy — only the gateway sets
+	// them, which makes the terminal marker unspoofable.
+	//
+	// headerStreamCancel tells a responder which subject to watch for a cancel
+	// signal. headerStreamTerm ("ok"/"error") marks the final frame of a stream;
+	// headerStreamErr carries the error message on an error terminal.
+	headerStreamCancel = "cc-stream-cancel"
+	headerStreamTerm   = "cc-stream-term"
+	headerStreamErr    = "cc-stream-error"
 )
 
 var upgrader = websocket.Upgrader{
@@ -59,6 +70,10 @@ type wsInbound struct {
 	// backed by a JetStream consumer keyed on (session_id, subject) that
 	// resumes and replays on reconnect. Empty means a plain core NATS sub.
 	SessionID string `json:"session_id,omitempty"`
+	// StreamID identifies an in-flight stream for cancel_stream.
+	StreamID string `json:"stream_id,omitempty"`
+	// Error carries the optional error terminal on a stream_end action.
+	Error string `json:"error,omitempty"`
 }
 
 type wsOutbound struct {
@@ -70,6 +85,7 @@ type wsOutbound struct {
 	ReplySubject string            `json:"reply_subject,omitempty"`
 	SessionID    string            `json:"session_id,omitempty"`
 	Count        int               `json:"count,omitempty"`
+	StreamID     string            `json:"stream_id,omitempty"`
 
 	// whoami response fields. WhoSubject carries the JWT `sub` claim under a
 	// distinct key — Subject above already means the NATS subject.
@@ -101,6 +117,7 @@ func (s *Server) websocketHandler(w http.ResponseWriter, r *http.Request) {
 		principal:   principal,
 		subs:        make(map[string]*nats.Subscription),
 		jsConsumers: make(map[string]*jsSub),
+		streams:     make(map[string]*streamState),
 	}
 	c.run()
 }
@@ -109,6 +126,15 @@ func (s *Server) websocketHandler(w http.ResponseWriter, r *http.Request) {
 type jsSub struct {
 	cc        jetstream.ConsumeContext
 	sessionID string
+}
+
+// streamState is an in-flight streaming request initiated on this connection.
+// The gateway owns the ephemeral inbox the responder streams to and the cancel
+// subject the responder watches; both are torn down when the stream ends, is
+// cancelled, or the connection drops.
+type streamState struct {
+	sub           *nats.Subscription // core sub on the ephemeral inbox
+	cancelSubject string             // where a cancel signal is published
 }
 
 type wsConn struct {
@@ -125,6 +151,7 @@ type wsConn struct {
 	mu          sync.Mutex
 	subs        map[string]*nats.Subscription // core NATS subscriptions, keyed by subject
 	jsConsumers map[string]*jsSub             // durable session consumers, keyed by subject
+	streams     map[string]*streamState       // in-flight request_stream, keyed by stream_id
 }
 
 func (c *wsConn) run() {
@@ -142,6 +169,13 @@ func (c *wsConn) run() {
 		for subj, e := range c.jsConsumers {
 			e.cc.Stop()
 			delete(c.jsConsumers, subj)
+		}
+		// Cancel any in-flight streams so responders stop producing (and paying
+		// for upstream work) when the requester disappears, then drop the inboxes.
+		for id, st := range c.streams {
+			c.server.nc.Publish(st.cancelSubject, nil)
+			st.sub.Unsubscribe()
+			delete(c.streams, id)
 		}
 		c.mu.Unlock()
 		c.conn.Close()
@@ -185,6 +219,14 @@ func (c *wsConn) run() {
 			c.handleWhoami()
 		case "publish":
 			c.handlePublish(msg)
+		case "request_stream":
+			c.handleRequestStream(msg)
+		case "cancel_stream":
+			c.handleCancelStream(msg)
+		case "stream_send":
+			c.handleStreamSend(msg)
+		case "stream_end":
+			c.handleStreamEnd(msg)
 		default:
 			c.send(wsOutbound{Type: "error", Error: "unknown action: " + msg.Action})
 		}
@@ -489,6 +531,157 @@ func (c *wsConn) handlePublish(msg wsInbound) {
 	}
 
 	c.send(wsOutbound{Type: "published", Subject: msg.Subject})
+}
+
+// --- streaming responses ---
+//
+// A requester sends request_stream; the gateway mints an ephemeral inbox and a
+// cancel subject, publishes the request with the reply set to the inbox, and
+// relays everything that lands on the inbox to the requester as stream_chunk
+// frames — until a frame carrying the cc-stream-term header (set only by the
+// gateway, via stream_end) closes the stream. A responder streams with
+// stream_send / stream_end against the reply subject it received. Ephemeral: a
+// requester that disconnects loses the tail and re-requests; nothing is durable.
+
+// handleRequestStream begins a streaming request. It subscribes the ephemeral
+// inbox, publishes the request, and acks with stream_started.
+func (c *wsConn) handleRequestStream(msg wsInbound) {
+	if msg.Subject == "" {
+		c.send(wsOutbound{Type: "error", Error: "subject is required"})
+		return
+	}
+	data, err := base64.StdEncoding.DecodeString(msg.Data)
+	if err != nil {
+		c.send(wsOutbound{Type: "error", Error: "data must be base64 encoded"})
+		return
+	}
+
+	// The requester supplies stream_id so it can register its handler before the
+	// first frame arrives; fall back to a generated one for robustness.
+	streamID := msg.StreamID
+	if streamID == "" {
+		streamID = "st_" + generateAckID()
+	}
+	inbox := "_stream." + generateAckID()
+	cancelSubject := inbox + ".cancel"
+
+	// Relay inbox messages to the requester. A frame stamped cc-stream-term is the
+	// terminal: ok -> stream_end, error -> stream_error; both tear the stream down.
+	sub, err := c.server.nc.Subscribe(inbox, func(m *nats.Msg) {
+		out, terminal := streamFrameFor(streamID, m)
+		c.send(out)
+		if terminal {
+			c.teardownStream(streamID, false)
+		}
+	})
+	if err != nil {
+		c.send(wsOutbound{Type: "error", Error: "stream subscribe failed: " + err.Error()})
+		return
+	}
+	if err := c.server.nc.Flush(); err != nil {
+		sub.Unsubscribe()
+		c.send(wsOutbound{Type: "error", Error: "stream flush failed: " + err.Error()})
+		return
+	}
+
+	c.mu.Lock()
+	c.streams[streamID] = &streamState{sub: sub, cancelSubject: cancelSubject}
+	c.mu.Unlock()
+
+	// Tell the responder where to stream (Reply) and where to watch for a cancel.
+	header := buildStampedHeader(msg.Headers, c.principal)
+	header.Set(headerStreamCancel, cancelSubject)
+	pub := &nats.Msg{Subject: msg.Subject, Reply: inbox, Data: data, Header: header}
+	if err := c.server.nc.PublishMsg(pub); err != nil {
+		c.teardownStream(streamID, false)
+		c.send(wsOutbound{Type: "error", Error: "stream publish failed: " + err.Error()})
+		return
+	}
+
+	c.send(wsOutbound{Type: "stream_started", StreamID: streamID})
+}
+
+// streamFrameFor maps an inbox message to the frame the requester should see. A
+// message stamped with the gateway-only cc-stream-term header is terminal
+// (ok -> stream_end, error -> stream_error); anything else is a chunk.
+func streamFrameFor(streamID string, m *nats.Msg) (out wsOutbound, terminal bool) {
+	switch m.Header.Get(headerStreamTerm) {
+	case "ok":
+		return wsOutbound{Type: "stream_end", StreamID: streamID}, true
+	case "error":
+		return wsOutbound{Type: "stream_error", StreamID: streamID, Error: m.Header.Get(headerStreamErr)}, true
+	default:
+		return wsOutbound{Type: "stream_chunk", StreamID: streamID, Data: base64.StdEncoding.EncodeToString(m.Data)}, false
+	}
+}
+
+// handleCancelStream signals the responder to stop, closes the requester's
+// stream with a terminal frame, and tears the inbox down.
+func (c *wsConn) handleCancelStream(msg wsInbound) {
+	c.mu.Lock()
+	_, ok := c.streams[msg.StreamID]
+	c.mu.Unlock()
+	if ok {
+		c.send(wsOutbound{Type: "stream_end", StreamID: msg.StreamID})
+	}
+	c.teardownStream(msg.StreamID, true)
+}
+
+// handleStreamSend publishes one chunk to the reply subject the responder was
+// handed. The subject is the ephemeral inbox; data is the chunk payload.
+func (c *wsConn) handleStreamSend(msg wsInbound) {
+	if msg.Subject == "" {
+		c.send(wsOutbound{Type: "error", Error: "subject is required"})
+		return
+	}
+	data, err := base64.StdEncoding.DecodeString(msg.Data)
+	if err != nil {
+		c.send(wsOutbound{Type: "error", Error: "data must be base64 encoded"})
+		return
+	}
+	m := &nats.Msg{Subject: msg.Subject, Data: data, Header: buildStampedHeader(msg.Headers, c.principal)}
+	if err := c.server.nc.PublishMsg(m); err != nil {
+		c.send(wsOutbound{Type: "error", Error: "stream_send failed: " + err.Error()})
+	}
+}
+
+// handleStreamEnd publishes the terminal frame: the gateway stamps cc-stream-term
+// (and cc-stream-error on failure) so the requester side can close cleanly.
+func (c *wsConn) handleStreamEnd(msg wsInbound) {
+	if msg.Subject == "" {
+		c.send(wsOutbound{Type: "error", Error: "subject is required"})
+		return
+	}
+	header := buildStampedHeader(msg.Headers, c.principal)
+	if msg.Error != "" {
+		header.Set(headerStreamTerm, "error")
+		header.Set(headerStreamErr, msg.Error)
+	} else {
+		header.Set(headerStreamTerm, "ok")
+	}
+	m := &nats.Msg{Subject: msg.Subject, Header: header}
+	if err := c.server.nc.PublishMsg(m); err != nil {
+		c.send(wsOutbound{Type: "error", Error: "stream_end failed: " + err.Error()})
+	}
+}
+
+// teardownStream drops the inbox subscription for a stream and, when signalCancel
+// is set, publishes to its cancel subject so the responder stops producing. Safe
+// to call for an unknown id (no-op).
+func (c *wsConn) teardownStream(streamID string, signalCancel bool) {
+	c.mu.Lock()
+	st, ok := c.streams[streamID]
+	if ok {
+		delete(c.streams, streamID)
+	}
+	c.mu.Unlock()
+	if !ok {
+		return
+	}
+	if signalCancel {
+		c.server.nc.Publish(st.cancelSubject, nil)
+	}
+	st.sub.Unsubscribe()
 }
 
 // handleWhoami reports the connection's verified identity. Strictly
