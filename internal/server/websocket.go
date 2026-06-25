@@ -52,6 +52,13 @@ const (
 	headerStreamCancel = "cc-stream-cancel"
 	headerStreamTerm   = "cc-stream-term"
 	headerStreamErr    = "cc-stream-error"
+	// headerStreamUpload (on a request_upload) tells the responder which subject to
+	// read the streamed *request* body from; headerStreamReady is the responder's
+	// signal — relayed to the requester as upload_ready — that it has subscribed
+	// that subject and the requester may begin sending chunks. Both are gateway-set
+	// (cc-prefixed, so stripped from client input) and therefore unspoofable.
+	headerStreamUpload = "cc-stream-upload"
+	headerStreamReady  = "cc-stream-ready"
 )
 
 var upgrader = websocket.Upgrader{
@@ -86,6 +93,9 @@ type wsOutbound struct {
 	SessionID    string            `json:"session_id,omitempty"`
 	Count        int               `json:"count,omitempty"`
 	StreamID     string            `json:"stream_id,omitempty"`
+	// UploadSubject is where a request_upload requester pushes its request body
+	// (with stream_send/stream_end); carried on the upload_started ack.
+	UploadSubject string `json:"upload_subject,omitempty"`
 
 	// whoami response fields. WhoSubject carries the JWT `sub` claim under a
 	// distinct key — Subject above already means the NATS subject.
@@ -221,10 +231,14 @@ func (c *wsConn) run() {
 			c.handlePublish(msg)
 		case "request_stream":
 			c.handleRequestStream(msg)
+		case "request_upload":
+			c.handleRequestUpload(msg)
 		case "cancel_stream":
 			c.handleCancelStream(msg)
 		case "stream_send":
 			c.handleStreamSend(msg)
+		case "stream_ready":
+			c.handleStreamReady(msg)
 		case "stream_end":
 			c.handleStreamEnd(msg)
 		default:
@@ -533,7 +547,7 @@ func (c *wsConn) handlePublish(msg wsInbound) {
 	c.send(wsOutbound{Type: "published", Subject: msg.Subject})
 }
 
-// --- streaming responses ---
+// --- streaming responses & requests ---
 //
 // A requester sends request_stream; the gateway mints an ephemeral inbox and a
 // cancel subject, publishes the request with the reply set to the inbox, and
@@ -542,10 +556,32 @@ func (c *wsConn) handlePublish(msg wsInbound) {
 // gateway, via stream_end) closes the stream. A responder streams with
 // stream_send / stream_end against the reply subject it received. Ephemeral: a
 // requester that disconnects loses the tail and re-requests; nothing is durable.
+//
+// request_upload additionally streams the *request* body: the gateway mints an
+// upload subject (handed to the responder via cc-stream-upload, returned to the
+// requester on upload_started) that the requester feeds with stream_send /
+// stream_end. Because core NATS won't buffer chunks published before the
+// responder's interest propagates, the responder sends stream_ready once it has
+// subscribed the upload subject; the gateway relays that as upload_ready, and the
+// requester only then begins sending. The response still comes back over the
+// inbox, so request_upload is full bidirectional streaming.
 
-// handleRequestStream begins a streaming request. It subscribes the ephemeral
-// inbox, publishes the request, and acks with stream_started.
-func (c *wsConn) handleRequestStream(msg wsInbound) {
+// handleRequestStream begins a streaming request whose response is delivered as
+// stream_chunk frames. See beginStream.
+func (c *wsConn) handleRequestStream(msg wsInbound) { c.beginStream(msg, false) }
+
+// handleRequestUpload begins a streaming request whose request body is also
+// streamed (via an upload subject the requester feeds with stream_send /
+// stream_end). See beginStream.
+func (c *wsConn) handleRequestUpload(msg wsInbound) { c.beginStream(msg, true) }
+
+// beginStream is the shared setup for request_stream and request_upload. It mints
+// the ephemeral response inbox + cancel subject, subscribes the inbox to relay
+// response frames to the requester, then publishes the initial request with the
+// reply set to the inbox. When withUpload is set it also mints an upload subject,
+// hands it to the responder via cc-stream-upload, and returns it on upload_started
+// so the requester can stream the request body to it.
+func (c *wsConn) beginStream(msg wsInbound, withUpload bool) {
 	if msg.Subject == "" {
 		c.send(wsOutbound{Type: "error", Error: "subject is required"})
 		return
@@ -566,7 +602,8 @@ func (c *wsConn) handleRequestStream(msg wsInbound) {
 	cancelSubject := inbox + ".cancel"
 
 	// Relay inbox messages to the requester. A frame stamped cc-stream-term is the
-	// terminal: ok -> stream_end, error -> stream_error; both tear the stream down.
+	// terminal (ok -> stream_end, error -> stream_error; both tear down); a frame
+	// stamped cc-stream-ready becomes upload_ready; anything else is a chunk.
 	sub, err := c.server.nc.Subscribe(inbox, func(m *nats.Msg) {
 		out, terminal := streamFrameFor(streamID, m)
 		c.send(out)
@@ -588,9 +625,15 @@ func (c *wsConn) handleRequestStream(msg wsInbound) {
 	c.streams[streamID] = &streamState{sub: sub, cancelSubject: cancelSubject}
 	c.mu.Unlock()
 
-	// Tell the responder where to stream (Reply) and where to watch for a cancel.
+	// Tell the responder where to stream the response (Reply) and where to watch
+	// for a cancel; for an upload, also where to read the request body from.
 	header := buildStampedHeader(msg.Headers, c.principal)
 	header.Set(headerStreamCancel, cancelSubject)
+	uploadSubject := ""
+	if withUpload {
+		uploadSubject = "_upload." + generateAckID()
+		header.Set(headerStreamUpload, uploadSubject)
+	}
 	pub := &nats.Msg{Subject: msg.Subject, Reply: inbox, Data: data, Header: header}
 	if err := c.server.nc.PublishMsg(pub); err != nil {
 		c.teardownStream(streamID, false)
@@ -598,21 +641,29 @@ func (c *wsConn) handleRequestStream(msg wsInbound) {
 		return
 	}
 
-	c.send(wsOutbound{Type: "stream_started", StreamID: streamID})
+	if withUpload {
+		// The requester must wait for upload_ready before sending chunks.
+		c.send(wsOutbound{Type: "upload_started", StreamID: streamID, UploadSubject: uploadSubject})
+	} else {
+		c.send(wsOutbound{Type: "stream_started", StreamID: streamID})
+	}
 }
 
 // streamFrameFor maps an inbox message to the frame the requester should see. A
 // message stamped with the gateway-only cc-stream-term header is terminal
-// (ok -> stream_end, error -> stream_error); anything else is a chunk.
+// (ok -> stream_end, error -> stream_error); cc-stream-ready -> upload_ready (the
+// responder is ready for the upload body); anything else is a chunk.
 func streamFrameFor(streamID string, m *nats.Msg) (out wsOutbound, terminal bool) {
 	switch m.Header.Get(headerStreamTerm) {
 	case "ok":
 		return wsOutbound{Type: "stream_end", StreamID: streamID}, true
 	case "error":
 		return wsOutbound{Type: "stream_error", StreamID: streamID, Error: m.Header.Get(headerStreamErr)}, true
-	default:
-		return wsOutbound{Type: "stream_chunk", StreamID: streamID, Data: base64.StdEncoding.EncodeToString(m.Data)}, false
 	}
+	if m.Header.Get(headerStreamReady) != "" {
+		return wsOutbound{Type: "upload_ready", StreamID: streamID}, false
+	}
+	return wsOutbound{Type: "stream_chunk", StreamID: streamID, Data: base64.StdEncoding.EncodeToString(m.Data)}, false
 }
 
 // handleCancelStream signals the responder to stop, closes the requester's
@@ -642,6 +693,24 @@ func (c *wsConn) handleStreamSend(msg wsInbound) {
 	m := &nats.Msg{Subject: msg.Subject, Data: data, Header: buildStampedHeader(msg.Headers, c.principal)}
 	if err := c.server.nc.PublishMsg(m); err != nil {
 		c.send(wsOutbound{Type: "error", Error: "stream_send failed: " + err.Error()})
+	}
+}
+
+// handleStreamReady is sent by an upload responder once it has subscribed the
+// upload subject. The gateway stamps the gateway-only cc-stream-ready header and
+// publishes to the responder's reply inbox (msg.Subject); the requester sees it
+// as upload_ready and only then begins streaming the request body — closing the
+// race where chunks published before the responder's interest propagates are lost.
+func (c *wsConn) handleStreamReady(msg wsInbound) {
+	if msg.Subject == "" {
+		c.send(wsOutbound{Type: "error", Error: "subject is required"})
+		return
+	}
+	header := buildStampedHeader(msg.Headers, c.principal)
+	header.Set(headerStreamReady, "1")
+	m := &nats.Msg{Subject: msg.Subject, Header: header}
+	if err := c.server.nc.PublishMsg(m); err != nil {
+		c.send(wsOutbound{Type: "error", Error: "stream_ready failed: " + err.Error()})
 	}
 }
 

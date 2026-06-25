@@ -332,6 +332,49 @@ requester's stream is closed with a terminal `stream_end` either way.
 Backward compatible: the streaming actions are additive, so an older gateway answers an unknown
 `request_stream` with a generic `{"type":"error", …}` and clients can fall back.
 
+#### Streaming requests (uploads)
+
+`request_upload` streams the *request body* the same way `request_stream` streams a response — for
+payloads too large for a single 1 MB message (large object writes, bulk imports). The response still
+comes back as `stream_chunk` frames, so it is **full bidirectional streaming**. Like responses it is
+ephemeral (core NATS, no durability).
+
+**Requester → gateway**
+
+```json
+{"action": "request_upload", "subject": "storage.put.stream", "data": "<base64 metadata>", "headers": {…}}
+```
+
+The gateway mints the response inbox (as for `request_stream`) **and** an ephemeral upload subject,
+hands the upload subject to the responder via a gateway-set `cc-stream-upload` header, and acks:
+
+```json
+{"type": "upload_started", "stream_id": "cs_…", "upload_subject": "_upload.…"}
+```
+
+The requester **must wait for `upload_ready`** before sending chunks: core NATS does not buffer
+messages published before the responder's subscription interest has propagated, so chunks sent too
+early are lost. Once ready, the requester streams the body to the upload subject with the ordinary
+`stream_send` / `stream_end` actions, then consumes the response frames:
+
+```json
+{"action": "stream_send", "subject": "<upload_subject>", "data": "<base64>"}
+{"action": "stream_end",  "subject": "<upload_subject>"}
+```
+
+**Responder.** The initial `message` carries `cc-stream-upload` (where to read the request body) in
+addition to `reply_subject` and `cc-stream-cancel`. The responder subscribes the upload subject,
+signals readiness, reads chunks until the terminal, then streams its response to `reply_subject`:
+
+```json
+{"action": "stream_ready", "subject": "<reply_subject>"}
+```
+
+The gateway stamps the trusted `cc-stream-ready` header and relays it to the requester as
+`{"type": "upload_ready", "stream_id": "cs_…"}`. `cancel_stream` and disconnect handling are
+identical to streaming responses. A responder that ignores `cc-stream-upload` never sends
+`stream_ready`, so the requester's wait for `upload_ready` is the capability check.
+
 #### Example: pub/sub
 
 ```bash
