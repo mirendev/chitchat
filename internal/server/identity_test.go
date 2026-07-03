@@ -82,6 +82,31 @@ func TestBuildStampedHeader(t *testing.T) {
 		}
 	})
 
+	t.Run("allows caller-asserted cc-user-* headers through", func(t *testing.T) {
+		client := map[string]string{
+			"cc-user-id":    "bob@example.com",
+			"cc-user-email": "bob@example.com",
+			"Cc-User-Name":  "Bob", // mixed casing still allowed
+			"cc-id":         "admin@evil", // gateway-owned: must be stripped/re-stamped
+		}
+		h := buildStampedHeader(client, apiKeyPrincipal)
+
+		// The caller-asserted end-user identity survives.
+		if got := h.Get("cc-user-id"); got != "bob@example.com" {
+			t.Errorf("cc-user-id = %q, want bob@example.com", got)
+		}
+		if got := h.Get("cc-user-email"); got != "bob@example.com" {
+			t.Errorf("cc-user-email = %q, want bob@example.com", got)
+		}
+		if got := h.Get("Cc-User-Name"); got != "Bob" {
+			t.Errorf("Cc-User-Name = %q, want Bob", got)
+		}
+		// But the gateway-owned cc-id is still the verified value, not the spoof.
+		if got := h.Get(headerIdentity); got != auth.APIKeyIdentity {
+			t.Errorf("cc-id = %q, want %q (spoof stripped)", got, auth.APIKeyIdentity)
+		}
+	})
+
 	t.Run("nil principal still strips reserved client headers", func(t *testing.T) {
 		client := map[string]string{
 			"cc-id": "admin@evil",

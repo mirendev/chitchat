@@ -62,6 +62,27 @@ The names are deliberately short — they ride on every message. Recipients read
 
 **These headers are unspoofable.** The `cc-` prefix is reserved: the gateway strips any client-supplied `cc-*` header (in any casing) before stamping its own, and NATS is reachable only through the gateway — so a caller cannot assert an identity that isn't theirs.
 
+#### Acting on behalf of an end user (`cc-user-*`)
+
+A service that fronts many end users (e.g. a web UI) can name the **end user** it
+is acting for by setting these headers — the one exception the gateway lets a
+caller assert:
+
+| Header | Value |
+| --- | --- |
+| `cc-user-id` | Canonical end-user identity the caller is acting on behalf of |
+| `cc-user-email` | The end user's email, when known |
+| `cc-user-name` | The end user's display name, when known |
+
+Semantics: the gateway-verified `cc-*` above remain the **acting service** (the
+actor); `cc-user-*` are the **end user** (the subject). Unlike `cc-*`, **`cc-user-*`
+are caller-asserted, not gateway-verified** — the gateway passes them through
+rather than stripping them, so their trust is only as good as the asserting
+service. Recipients that need provenance should treat `cc-user-*` as "who the
+actor (`cc-id`) claims to be acting for." A future mode may have the gateway
+verify a supplied end-user token and stamp `cc-user-*` itself; the header names
+are stable so that upgrade is transparent to recipients.
+
 To ask the gateway for your own identity:
 
 ```

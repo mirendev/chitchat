@@ -23,19 +23,32 @@ const (
 	// would let "Cc-Id" (or any other casing) slip through — we must compare on
 	// the lowercased, trimmed prefix.
 	reservedHeaderPrefix = "cc-"
+
+	// userHeaderPrefix carves out a caller-asserted end-user identity namespace
+	// (cc-user-id / cc-user-email / cc-user-name) from the reserved cc- prefix.
+	// Unlike the gateway-owned cc-{id,auth,email,sub}, these are NOT verified by
+	// the gateway — a trusted service (e.g. inu-web) sets them to name the end
+	// user it is acting on behalf of, and recipients read them as the subject
+	// while cc-* remains the verified acting service. A future mode may have the
+	// gateway verify a supplied user token and stamp these itself; the header
+	// names are stable so that upgrade is transparent to recipients.
+	userHeaderPrefix = "cc-user-"
 )
 
-// buildStampedHeader copies the client's headers minus any reserved cc-* keys
-// (in any casing — anti-spoofing), then stamps the caller's
-// verified identity from p. It always returns a non-nil header so identity is
-// present even when the client sent no headers. A nil principal still strips
-// reserved keys (fail closed) but stamps nothing.
+// buildStampedHeader copies the client's headers minus the gateway-owned
+// cc-{id,auth,email,sub} keys (in any casing — anti-spoofing), then stamps the
+// caller's verified identity from p. Client-set cc-user-* headers are allowed
+// through (a caller-asserted end-user identity; see userHeaderPrefix). It always
+// returns a non-nil header so identity is present even when the client sent no
+// headers. A nil principal still strips the reserved keys (fail closed) but
+// stamps nothing.
 func buildStampedHeader(clientHeaders map[string]string, p *auth.Principal) nats.Header {
 	h := make(nats.Header)
 
 	for k, v := range clientHeaders {
-		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(k)), reservedHeaderPrefix) {
-			continue // never let a client assert its own identity
+		lk := strings.ToLower(strings.TrimSpace(k))
+		if strings.HasPrefix(lk, reservedHeaderPrefix) && !strings.HasPrefix(lk, userHeaderPrefix) {
+			continue // never let a client assert the gateway-owned cc-* identity
 		}
 		h.Set(k, v)
 	}
