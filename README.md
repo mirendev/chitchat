@@ -1,6 +1,56 @@
 # Chitchat
 
-Inter-service messaging for the Miren garden cluster, powered by NATS with JetStream. Chitchat runs NATS internally and exposes an authenticated HTTP API so any service can publish, subscribe, and consume durable streams without a native NATS client.
+Inter-service messaging for the Miren garden cluster, powered by NATS with JetStream. Chitchat runs NATS internally and exposes an authenticated HTTP and WebSocket API, so any service can publish, subscribe, and consume durable streams without holding NATS credentials of its own.
+
+> **This is our internal tooling, shared for posterity.**
+>
+> Chitchat is the message bus Miren's own services talk over. It's shaped
+> entirely around that job: our auth, our identity model, our subject
+> conventions. It's public so our Go client is importable, and because we'd
+> rather you be able to read it than not.
+>
+> Trade-offs, up front: there's no support, no stability promise, and we'll make
+> breaking changes whenever they suit us. Don't build anything load-bearing on it.
+>
+> If you're building something similar and want to compare notes, come say hi in
+> [our Discord](https://miren.dev/discord). We'd love to hear from you.
+
+## Go client
+
+Services talk to chitchat over the long-lived `/v1/ws` endpoint, so subscribe and publish share one connection instead of a fresh HTTP call per message. The client lives in [`client/`](client) as its own module, so importing it doesn't drag the gateway's dependencies into your build.
+
+```bash
+go get miren.dev/chitchat/client
+```
+
+```go
+import chitchat "miren.dev/chitchat/client"
+
+cc, err := chitchat.New(
+    "https://chitchat.miren.garden",
+    chitchat.TokenSourceFunc(multipass.Token), // fetched fresh on every reconnect
+    logger,
+    chitchat.WithInboxPrefix("code.inbox."),   // namespaces this service's reply inboxes
+)
+if err != nil {
+    return err
+}
+
+cc.Subscribe("code.event.>", func(ctx context.Context, msg chitchat.Message) {
+    log.Info("event", "subject", msg.Subject, "from", msg.Caller())
+})
+
+go cc.Run(ctx) // connects, reconnects with backoff, replays subscriptions
+
+reply, err := cc.Request(ctx, "code.prs", listPRs{Repo: "mirendev/runtime"})
+if errors.Is(err, chitchat.ErrNoResponders) {
+    // Nobody is subscribed to code.prs. This is an answer, not a timeout.
+}
+```
+
+`Run` owns the connection: it dials, reconnects with exponential backoff, and replays every subscription on each new connection. A replay the gateway doesn't confirm drops the connection and retries, so a client that comes back without its subscriptions fails loudly rather than sitting there looking healthy while serving nothing. Note that the socket is usable slightly before that confirmation lands, so a publish issued during the replay window will go out; it's the `chitchat connected` log line that waits for every subscription to be acked.
+
+Delivery semantics are per-subscription. `Subscribe` is a plain core NATS subscription: at-most-once and live-only. `SubscribeWithSession` binds a durable JetStream consumer keyed on `(sessionID, subject)`, which gives you catch-up on connect and at-least-once delivery, provided a stream already covers the subject. See [Delivery Guarantees](#delivery-guarantees).
 
 ## Deploy
 
