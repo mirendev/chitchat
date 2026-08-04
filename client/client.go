@@ -99,9 +99,19 @@ func (id Identity) String() string {
 	return id.ID + " (" + id.Auth + ")"
 }
 
-// Caller returns the sender's verified identity. Equivalent to reading the
-// Identity field; both spellings exist because callers use both.
-func (m Message) Caller() Identity { return m.Identity }
+// Caller returns the sender's verified identity.
+//
+// This reads the cc-* headers rather than returning the Identity field, because
+// the headers are the source of truth and Identity is only a convenience the
+// read loop fills in on delivery. A Message built by hand (a test constructing
+// one from headers, say) would otherwise report an empty caller, which is a
+// quiet way to lose the identity that audit logging depends on.
+func (m Message) Caller() Identity {
+	if id := identityFromHeaders(m.Headers); id != (Identity{}) {
+		return id
+	}
+	return m.Identity
+}
 
 // CallerID returns the gateway-stamped identity of whoever sent this message
 // (the JWT email, else its subject, or "apikey"). Empty if absent.

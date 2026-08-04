@@ -837,3 +837,35 @@ func TestReplayGivesUpOnExpiredContext(t *testing.T) {
 		t.Errorf("replay took %v; it should give up immediately", elapsed)
 	}
 }
+
+// TestCallerFromHandBuiltMessage covers a regression found by cutting
+// clusteragent over: it constructs a Message from headers and calls Caller() to
+// log who made an RPC. Returning the Identity field alone reported an empty
+// caller for any Message the read loop didn't build, which is a quiet way to
+// lose the identity audit logging depends on.
+func TestCallerFromHandBuiltMessage(t *testing.T) {
+	m := Message{
+		Subject: "clusteragent.ping",
+		Headers: map[string]string{"cc-id": "evan@miren.dev", "cc-auth": "jwt"},
+	}
+	got := m.Caller()
+	if got.ID != "evan@miren.dev" || got.Auth != "jwt" {
+		t.Errorf("Caller() = %+v, want the identity from the headers", got)
+	}
+
+	// A delivered message has both; they must agree.
+	delivered := Message{Headers: m.Headers, Identity: identityFromHeaders(m.Headers)}
+	if delivered.Caller() != got {
+		t.Errorf("delivered Caller() = %+v, want %+v", delivered.Caller(), got)
+	}
+
+	// No headers at all falls back to whatever the field holds.
+	only := Message{Identity: Identity{ID: "svc", Auth: "apikey"}}
+	if only.Caller().ID != "svc" {
+		t.Errorf("fallback to the Identity field failed: %+v", only.Caller())
+	}
+
+	if (Message{}).Caller() != (Identity{}) {
+		t.Error("an empty Message should have an empty caller")
+	}
+}
