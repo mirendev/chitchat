@@ -259,6 +259,9 @@ type Client struct {
 	uploads    map[string]*uploadState     // stream_id -> in-flight Upload
 	responders map[string]*StreamResponder // cancel subject -> live responder
 	connected  bool
+	// connectedCh is closed when a connection comes up and replaced when one
+	// goes down, so WaitConnected can block without polling.
+	connectedCh chan struct{}
 
 	// writeCh is the outbound queue for the *current* connection. It is nil
 	// while disconnected and replaced wholesale on every connect, so a
@@ -314,11 +317,36 @@ func New(baseURL string, tokens TokenSource, logger *slog.Logger, opts ...Option
 		streams:       map[string]*streamSub{},
 		uploads:       map[string]*uploadState{},
 		responders:    map[string]*StreamResponder{},
+		connectedCh:   make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(c)
 	}
 	return c, nil
+}
+
+// WaitConnected blocks until the client has a live connection, or ctx fires.
+//
+// Run connects asynchronously, so code that starts it and immediately issues a
+// Request is racing the dial. Publishing or subscribing before then returns
+// ErrNotConnected rather than queueing, so short-lived callers (a CLI doing one
+// request/reply, say) should wait here first. Long-lived services usually don't
+// need it: they Subscribe up front and the replay handles the rest.
+func (c *Client) WaitConnected(ctx context.Context) error {
+	c.mu.Lock()
+	if c.connected {
+		c.mu.Unlock()
+		return nil
+	}
+	ch := c.connectedCh
+	c.mu.Unlock()
+
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Subscribe registers a handler for the given subject. NATS wildcards (`*`,
@@ -688,6 +716,7 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 	c.conn = conn
 	c.writeCh = ch
 	c.connected = true
+	close(c.connectedCh)
 	replay := make([]replaySub, 0, len(c.subs))
 	for subject, s := range c.subs {
 		replay = append(replay, replaySub{subject: subject, sessionID: s.sessionID})
@@ -699,6 +728,7 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 		c.conn = nil
 		c.writeCh = nil
 		c.connected = false
+		c.connectedCh = make(chan struct{})
 		c.mu.Unlock()
 		// Streams are ephemeral and don't survive a reconnect, so anything in
 		// flight has to be told rather than left hanging on a dead channel.

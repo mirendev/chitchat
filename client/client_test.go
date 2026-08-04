@@ -1032,3 +1032,45 @@ func TestExportedIdentityHelpers(t *testing.T) {
 		t.Error("nil headers should give a zero Identity")
 	}
 }
+
+// TestWaitConnected covers the gap that surfaced cutting inu over: Run connects
+// asynchronously, so a caller that starts it and immediately issues a Request is
+// racing the dial. The old client hid that by queueing into a channel that
+// existed from construction; this one fails fast, so callers need a way to wait.
+func TestWaitConnected(t *testing.T) {
+	gw := &fakeGateway{reply: []byte(`{"ok":true}`)}
+	srv := httptest.NewServer(gw.handler())
+	defer srv.Close()
+
+	c, _ := New(srv.URL, StaticToken("tok"), quietLogger())
+
+	// Before Run, waiting must respect the caller's deadline rather than hang.
+	early, cancelEarly := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancelEarly()
+	if err := c.WaitConnected(early); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitConnected before Run = %v, want DeadlineExceeded", err)
+	}
+
+	ctx := t.Context()
+	go func() { _ = c.Run(ctx) }()
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.WaitConnected(waitCtx); err != nil {
+		t.Fatalf("WaitConnected: %v", err)
+	}
+
+	// Having waited, a request must work immediately rather than race the dial.
+	reqCtx, reqCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer reqCancel()
+	if _, err := c.Request(reqCtx, "svc.do", map[string]any{}); err != nil {
+		t.Errorf("Request straight after WaitConnected: %v", err)
+	}
+
+	// Already connected: returns immediately, even with an expired context.
+	done, cancelDone := context.WithCancel(context.Background())
+	cancelDone()
+	if err := c.WaitConnected(done); err != nil {
+		t.Errorf("WaitConnected when already up = %v, want nil", err)
+	}
+}
