@@ -145,13 +145,28 @@ func headerLookup(h map[string]string, key string) string {
 	return ""
 }
 
+// Ambient-identity headers the gateway stamps on every message it delivers.
+// They're unspoofable: the gateway strips any client-supplied copy before
+// stamping its own, and it is the only path to NATS.
+const (
+	HeaderIdentity = "cc-id"    // canonical identity: JWT email else subject, or "apikey"
+	HeaderAuth     = "cc-auth"  // "jwt" or "apikey"
+	HeaderEmail    = "cc-email" // JWT email, when present
+	HeaderSubject  = "cc-sub"   // JWT subject, when present
+)
+
+// IdentityFromHeaders extracts the verified identity from a message's headers.
+// Message.Caller() is the usual way in; this is for callers holding a raw header
+// map, such as code bridging chitchat messages into another transport.
+func IdentityFromHeaders(h map[string]string) Identity { return identityFromHeaders(h) }
+
 // identityFromHeaders extracts the cc-* identity headers.
 func identityFromHeaders(h map[string]string) Identity {
 	return Identity{
-		ID:      headerLookup(h, "cc-id"),
-		Auth:    headerLookup(h, "cc-auth"),
-		Email:   headerLookup(h, "cc-email"),
-		Subject: headerLookup(h, "cc-sub"),
+		ID:      headerLookup(h, HeaderIdentity),
+		Auth:    headerLookup(h, HeaderAuth),
+		Email:   headerLookup(h, HeaderEmail),
+		Subject: headerLookup(h, HeaderSubject),
 	}
 }
 
@@ -241,6 +256,7 @@ type Client struct {
 	subs       map[string]subscription     // subject pattern -> subscription
 	subAcks    map[string]chan struct{}    // subject -> waiter for its "subscribed" ack
 	streams    map[string]*streamSub       // stream_id -> consumer (RequestStream)
+	uploads    map[string]*uploadState     // stream_id -> in-flight Upload
 	responders map[string]*StreamResponder // cancel subject -> live responder
 	connected  bool
 
@@ -296,6 +312,7 @@ func New(baseURL string, tokens TokenSource, logger *slog.Logger, opts ...Option
 		subs:          map[string]subscription{},
 		subAcks:       map[string]chan struct{}{},
 		streams:       map[string]*streamSub{},
+		uploads:       map[string]*uploadState{},
 		responders:    map[string]*StreamResponder{},
 	}
 	for _, opt := range opts {
@@ -420,6 +437,49 @@ func (c *Client) clearAck(subject string) {
 // If nothing is subscribed to subject, this returns ErrNoResponders rather than
 // waiting out the context.
 func (c *Client) Request(ctx context.Context, subject string, payload any) ([]byte, error) {
+	return c.RequestWithHeaders(ctx, subject, payload, nil)
+}
+
+// SubscribeAndWait registers handler and blocks until the gateway confirms the
+// subscription is live on NATS, or ctx fires. Use it when a publish is about to
+// race the subscribe, since the gateway only acks once the interest is
+// registered. Plain Subscribe is fine everywhere else.
+func (c *Client) SubscribeAndWait(ctx context.Context, subject string, handler Handler) error {
+	return c.subscribeAndWait(ctx, subject, handler)
+}
+
+// StreamReady signals, over the reply inbox subject, that this responder has
+// subscribed and the requester may start sending. The gateway relays it as
+// upload_ready.
+func (c *Client) StreamReady(subject string) error {
+	return c.sendAction(map[string]any{"action": "stream_ready", "subject": subject}, true)
+}
+
+// StreamSend publishes one streamed chunk to subject. There is no per-chunk ack;
+// it blocks when the outbound queue is full so a fast producer throttles rather
+// than losing chunks.
+func (c *Client) StreamSend(subject string, data []byte) error {
+	return c.sendAction(map[string]any{
+		"action":  "stream_send",
+		"subject": subject,
+		"data":    base64.StdEncoding.EncodeToString(data),
+	}, true)
+}
+
+// StreamEnd terminates a stream on subject. A non-empty errMsg makes it an error
+// terminal rather than a clean end.
+func (c *Client) StreamEnd(subject, errMsg string) error {
+	m := map[string]any{"action": "stream_end", "subject": subject}
+	if errMsg != "" {
+		m["error"] = errMsg
+	}
+	return c.sendAction(m, true)
+}
+
+// RequestWithHeaders is Request with headers attached to the outbound message,
+// for callers that need to pass metadata (cc-user-* end-user attribution, say)
+// alongside the payload.
+func (c *Client) RequestWithHeaders(ctx context.Context, subject string, payload any, headers map[string]string) ([]byte, error) {
 	inbox, err := c.newInboxSubject()
 	if err != nil {
 		return nil, err
@@ -443,7 +503,7 @@ func (c *Client) Request(ctx context.Context, subject string, payload any) ([]by
 	if err != nil {
 		return nil, fmt.Errorf("marshal payload: %w", err)
 	}
-	if err := c.Publish(subject, raw, nil, inbox); err != nil {
+	if err := c.Publish(subject, raw, headers, inbox); err != nil {
 		return nil, err
 	}
 
@@ -643,6 +703,7 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 		// Streams are ephemeral and don't survive a reconnect, so anything in
 		// flight has to be told rather than left hanging on a dead channel.
 		c.failAllStreams(ErrStreamDisconnected)
+		c.failAllUploads(ErrStreamDisconnected)
 		// The requester is gone too, so a responder still generating chunks is
 		// working for nobody. This is what makes Canceled's "or disconnects"
 		// true rather than aspirational.
@@ -803,13 +864,14 @@ func (c *Client) replaySubscriptions(ctx context.Context, replay []replaySub) er
 
 func (c *Client) handleFrame(ctx context.Context, raw []byte) {
 	var env struct {
-		Type         string            `json:"type"`
-		Subject      string            `json:"subject"`
-		Data         string            `json:"data"`
-		Headers      map[string]string `json:"headers,omitempty"`
-		ReplySubject string            `json:"reply_subject,omitempty"`
-		StreamID     string            `json:"stream_id,omitempty"`
-		Error        string            `json:"error,omitempty"`
+		Type          string            `json:"type"`
+		Subject       string            `json:"subject"`
+		Data          string            `json:"data"`
+		Headers       map[string]string `json:"headers,omitempty"`
+		ReplySubject  string            `json:"reply_subject,omitempty"`
+		StreamID      string            `json:"stream_id,omitempty"`
+		UploadSubject string            `json:"upload_subject,omitempty"`
+		Error         string            `json:"error,omitempty"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
 		c.logger.Warn("chitchat: malformed frame", "err", err)
@@ -844,16 +906,48 @@ func (c *Client) handleFrame(ctx context.Context, raw []byte) {
 		c.mu.Unlock()
 	case "stream_started":
 		// Informational: the consumer channel is already registered by stream_id.
+	case "upload_started":
+		if u := c.uploadFor(env.StreamID); u != nil {
+			select {
+			case u.started <- env.UploadSubject:
+			default:
+			}
+		}
+	case "upload_ready":
+		if u := c.uploadFor(env.StreamID); u != nil {
+			select {
+			case u.ready <- struct{}{}:
+			default:
+			}
+		}
+	// RequestStream and Upload share the stream_* terminals and the stream_id
+	// space, so each frame goes to whichever map owns that id.
 	case "stream_chunk":
 		data, err := base64.StdEncoding.DecodeString(env.Data)
 		if err != nil {
 			c.logger.Warn("chitchat: bad stream base64", "err", err, "stream_id", env.StreamID)
 			return
 		}
+		if u := c.uploadFor(env.StreamID); u != nil {
+			select {
+			case u.chunks <- data:
+			case <-time.After(writeWait):
+				c.logger.Warn("chitchat: upload consumer stalled, dropping chunk", "stream_id", env.StreamID)
+			}
+			return
+		}
 		c.deliverStream(env.StreamID, StreamFrame{Data: data}, false)
 	case "stream_end":
+		if u := c.uploadFor(env.StreamID); u != nil {
+			u.fail(nil)
+			return
+		}
 		c.deliverStream(env.StreamID, StreamFrame{}, true)
 	case "stream_error":
+		if u := c.uploadFor(env.StreamID); u != nil {
+			u.fail(errors.New(env.Error))
+			return
+		}
 		c.deliverStream(env.StreamID, StreamFrame{Err: errors.New(env.Error)}, true)
 	case "unsubscribed", "published":
 		// nothing to do: successful action acks
@@ -957,6 +1051,28 @@ func (c *Client) sendAction(action map[string]any, block bool) error {
 		return nil
 	case <-t.C:
 		return ErrWriteQueueFull
+	}
+}
+
+// sendActionCtx is a blocking send bounded by ctx rather than writeWait. An
+// upload can legitimately spend minutes streaming a body, so its enqueues
+// should end when the caller gives up, not on a fixed socket-write deadline.
+func (c *Client) sendActionCtx(ctx context.Context, action map[string]any) error {
+	raw, err := json.Marshal(action)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	ch := c.writeCh
+	c.mu.Unlock()
+	if ch == nil {
+		return ErrNotConnected
+	}
+	select {
+	case ch <- raw:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

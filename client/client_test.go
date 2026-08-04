@@ -869,3 +869,166 @@ func TestCallerFromHandBuiltMessage(t *testing.T) {
 		t.Error("an empty Message should have an empty caller")
 	}
 }
+
+// TestRequestWithHeaders pins that caller metadata rides along on the outbound
+// message. inu needs this for cc-user-* end-user attribution.
+func TestRequestWithHeaders(t *testing.T) {
+	var mu sync.Mutex
+	var gotHeaders map[string]string
+	up := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			_, data, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			var m struct {
+				Action       string            `json:"action"`
+				Subject      string            `json:"subject"`
+				ReplySubject string            `json:"reply_subject"`
+				Headers      map[string]string `json:"headers"`
+			}
+			if json.Unmarshal(data, &m) != nil {
+				continue
+			}
+			switch m.Action {
+			case "subscribe":
+				_ = conn.WriteJSON(map[string]any{"type": "subscribed", "subject": m.Subject})
+			case "publish":
+				mu.Lock()
+				gotHeaders = m.Headers
+				mu.Unlock()
+				_ = conn.WriteJSON(map[string]any{
+					"type": "message", "subject": m.ReplySubject,
+					"data": base64.StdEncoding.EncodeToString([]byte(`{"ok":true}`)),
+				})
+			}
+		}
+	}))
+	defer srv.Close()
+
+	c, _ := New(srv.URL, StaticToken("tok"), quietLogger())
+	ctx := t.Context()
+	go func() { _ = c.Run(ctx) }()
+	waitConnected(t, c)
+
+	reqCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	hdr := map[string]string{"cc-user-id": "alice@example.com", "cc-user-name": "Alice"}
+	if _, err := c.RequestWithHeaders(reqCtx, "svc.do", map[string]any{}, hdr); err != nil {
+		t.Fatalf("RequestWithHeaders: %v", err)
+	}
+	mu.Lock()
+	seen := gotHeaders
+	mu.Unlock()
+	if seen["cc-user-id"] != "alice@example.com" || seen["cc-user-name"] != "Alice" {
+		t.Errorf("gateway saw headers %v", seen)
+	}
+
+	// Plain Request must still send none, rather than an empty map.
+	if _, err := c.Request(reqCtx, "svc.do", map[string]any{}); err != nil {
+		t.Fatalf("Request: %v", err)
+	}
+	mu.Lock()
+	seen = gotHeaders
+	mu.Unlock()
+	if len(seen) != 0 {
+		t.Errorf("plain Request sent headers %v", seen)
+	}
+}
+
+// TestClientLevelStreamActions covers the responder-side helpers storageagent
+// uses: they emit the right frames rather than going through StreamResponder.
+func TestClientLevelStreamActions(t *testing.T) {
+	var mu sync.Mutex
+	var frames []map[string]any
+	up := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			_, data, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			var m map[string]any
+			if json.Unmarshal(data, &m) == nil {
+				mu.Lock()
+				frames = append(frames, m)
+				mu.Unlock()
+			}
+		}
+	}))
+	defer srv.Close()
+
+	c, _ := New(srv.URL, StaticToken("tok"), quietLogger())
+	ctx := t.Context()
+	go func() { _ = c.Run(ctx) }()
+	waitConnected(t, c)
+
+	if err := c.StreamReady("reply.inbox.x"); err != nil {
+		t.Fatalf("StreamReady: %v", err)
+	}
+	if err := c.StreamSend("reply.inbox.x", []byte("chunk")); err != nil {
+		t.Fatalf("StreamSend: %v", err)
+	}
+	if err := c.StreamEnd("reply.inbox.x", ""); err != nil {
+		t.Fatalf("StreamEnd: %v", err)
+	}
+	if err := c.StreamEnd("reply.inbox.y", "boom"); err != nil {
+		t.Fatalf("StreamEnd(err): %v", err)
+	}
+
+	waitFor(t, 3*time.Second, "gateway did not see all four frames", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(frames) >= 4
+	})
+	mu.Lock()
+	defer mu.Unlock()
+	if frames[0]["action"] != "stream_ready" || frames[0]["subject"] != "reply.inbox.x" {
+		t.Errorf("frame 0 = %v", frames[0])
+	}
+	if frames[1]["action"] != "stream_send" ||
+		frames[1]["data"] != base64.StdEncoding.EncodeToString([]byte("chunk")) {
+		t.Errorf("frame 1 = %v", frames[1])
+	}
+	if frames[2]["action"] != "stream_end" {
+		t.Errorf("frame 2 = %v", frames[2])
+	}
+	if _, hasErr := frames[2]["error"]; hasErr {
+		t.Errorf("a clean StreamEnd must not carry an error: %v", frames[2])
+	}
+	if frames[3]["error"] != "boom" {
+		t.Errorf("frame 3 should carry the error: %v", frames[3])
+	}
+}
+
+// TestExportedIdentityHelpers covers what dan needs: the header names and a way
+// to build an Identity from a raw header map.
+func TestExportedIdentityHelpers(t *testing.T) {
+	if HeaderIdentity != "cc-id" || HeaderAuth != "cc-auth" ||
+		HeaderEmail != "cc-email" || HeaderSubject != "cc-sub" {
+		t.Error("header constants must match the gateway's stamped names")
+	}
+	h := map[string]string{
+		HeaderIdentity: "evan@miren.dev", HeaderAuth: "jwt",
+		HeaderEmail: "evan@miren.dev", HeaderSubject: "user-1",
+	}
+	got := IdentityFromHeaders(h)
+	want := Identity{ID: "evan@miren.dev", Auth: "jwt", Email: "evan@miren.dev", Subject: "user-1"}
+	if got != want {
+		t.Errorf("IdentityFromHeaders = %+v, want %+v", got, want)
+	}
+	if IdentityFromHeaders(nil) != (Identity{}) {
+		t.Error("nil headers should give a zero Identity")
+	}
+}
