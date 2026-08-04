@@ -1,0 +1,50 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Read-only by default, and checkout doesn't leave a usable credential behind.
+# This repo is public and CI runs code from pull requests, so the token that
+# sits in the workspace during a test run should be worth as little as possible.
+permissions:
+  contents: read
+
+# The gateway and the client are separate Go modules, so they need separate
+# jobs. A single `go test ./...` at the root skips client/ entirely, which is
+# exactly the trap this repo would otherwise be sitting in.
+jobs:
+  gateway:
+    name: Gateway
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+
+  client:
+    name: Client
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: client/go.mod
+      - run: go build ./...
+      - run: go vet ./...
+      # -race here specifically: the client is a pile of goroutines around one
+      # socket, and its regression tests drive reconnects under write pressure.
+      - run: go test -race ./...
