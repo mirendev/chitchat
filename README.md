@@ -264,6 +264,13 @@ Or use the `Authorization` header if your client supports it (non-browser client
 
 Response: `{"type": "subscribed", "subject": "orders.>"}`
 
+If subscription setup fails, the error echoes the subject so clients can
+correlate it with the pending request:
+
+```json
+{"type": "error", "subject": "orders.>", "error": "subscribe flush failed: ..."}
+```
+
 **Unsubscribe:**
 
 ```json

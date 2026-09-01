@@ -254,7 +254,7 @@ type Client struct {
 	mu         sync.Mutex
 	conn       *websocket.Conn
 	subs       map[string]subscription     // subject pattern -> subscription
-	subAcks    map[string]chan struct{}    // subject -> waiter for its "subscribed" ack
+	subAcks    map[string]chan error       // subject -> waiter for its subscribe result
 	streams    map[string]*streamSub       // stream_id -> consumer (RequestStream)
 	uploads    map[string]*uploadState     // stream_id -> in-flight Upload
 	responders map[string]*StreamResponder // cancel subject -> live responder
@@ -313,7 +313,7 @@ func New(baseURL string, tokens TokenSource, logger *slog.Logger, opts ...Option
 		replayTimeout: defaultReplayTimeout,
 		http:          &http.Client{Timeout: httpTimeout},
 		subs:          map[string]subscription{},
-		subAcks:       map[string]chan struct{}{},
+		subAcks:       map[string]chan error{},
 		streams:       map[string]*streamSub{},
 		uploads:       map[string]*uploadState{},
 		responders:    map[string]*StreamResponder{},
@@ -426,7 +426,7 @@ func (c *Client) PublishJSON(subject string, v any, replySubject string) error {
 // publishing keeps a publish from racing ahead of the subscription; the gateway
 // documents this as required.
 func (c *Client) subscribeAndWait(ctx context.Context, subject string, handler Handler) error {
-	ack := make(chan struct{})
+	ack := make(chan error, 1)
 	c.mu.Lock()
 	c.subs[subject] = subscription{handler: handler}
 	c.subAcks[subject] = ack
@@ -440,8 +440,14 @@ func (c *Client) subscribeAndWait(ctx context.Context, subject string, handler H
 		return err
 	}
 	select {
-	case <-ack:
-		return nil
+	case err := <-ack:
+		if err == nil {
+			return nil
+		}
+		c.mu.Lock()
+		delete(c.subs, subject)
+		c.mu.Unlock()
+		return err
 	case <-ctx.Done():
 		c.clearAck(subject)
 		c.mu.Lock()
@@ -853,10 +859,10 @@ func (c *Client) replaySubscriptions(ctx context.Context, replay []replaySub) er
 
 	// Register every ack waiter up front, so an ack that arrives while we're
 	// still sending the rest of the batch isn't missed.
-	acks := make([]chan struct{}, len(replay))
+	acks := make([]chan error, len(replay))
 	c.mu.Lock()
 	for i, s := range replay {
-		ack := make(chan struct{})
+		ack := make(chan error, 1)
 		c.subAcks[s.subject] = ack
 		acks[i] = ack
 	}
@@ -884,7 +890,10 @@ func (c *Client) replaySubscriptions(ctx context.Context, replay []replaySub) er
 	}
 	for i, ack := range acks {
 		select {
-		case <-ack:
+		case err := <-ack:
+			if err != nil {
+				return fmt.Errorf("subscribe %s: %w", replay[i].subject, err)
+			}
 		case <-ctx.Done():
 			return fmt.Errorf("no ack for %s: %w", replay[i].subject, ctx.Err())
 		}
@@ -931,7 +940,7 @@ func (c *Client) handleFrame(ctx context.Context, raw []byte) {
 		c.mu.Lock()
 		if ack, ok := c.subAcks[env.Subject]; ok {
 			delete(c.subAcks, env.Subject)
-			close(ack)
+			ack <- nil
 		}
 		c.mu.Unlock()
 	case "stream_started":
@@ -982,6 +991,17 @@ func (c *Client) handleFrame(ctx context.Context, raw []byte) {
 	case "unsubscribed", "published":
 		// nothing to do: successful action acks
 	case "error":
+		// Subscribe errors carry their subject on current gateways. Route them to
+		// the matching waiter so reconnect fails immediately instead of sitting on
+		// a request the gateway has already rejected until replayTimeout expires.
+		if env.Subject != "" {
+			c.mu.Lock()
+			if ack, ok := c.subAcks[env.Subject]; ok {
+				delete(c.subAcks, env.Subject)
+				ack <- errors.New(env.Error)
+			}
+			c.mu.Unlock()
+		}
 		// A gateway that predates the streaming protocol rejects request_stream
 		// with a generic error carrying no stream_id to correlate against, so
 		// every open stream has to fail for the caller to fall back.
@@ -989,7 +1009,8 @@ func (c *Client) handleFrame(ctx context.Context, raw []byte) {
 			c.failAllStreams(ErrStreamingUnsupported)
 			return
 		}
-		c.logger.Warn("chitchat: server error", "err", env.Error)
+		// Keep the rejection visible even when a subscribe waiter consumed it.
+		c.logger.Warn("chitchat: server error", "subject", env.Subject, "err", env.Error)
 	}
 }
 
