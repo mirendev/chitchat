@@ -1,4 +1,4 @@
-name: Deploy Prod
+name: Deploy Garden
 
 on:
   push:
@@ -19,5 +19,5 @@ jobs:
 
       - uses: mirendev/actions/deploy@main
         with:
-          cluster: ${{ secrets.MIREN_CLUSTER_PROD }}
+          cluster: ${{ secrets.MIREN_CLUSTER_GARDEN }}
           app: chitchat
