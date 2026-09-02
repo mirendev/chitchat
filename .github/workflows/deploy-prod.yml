@@ -1,0 +1,23 @@
+name: Deploy Prod
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: mirendev/actions/deploy@main
+        with:
+          cluster: ${{ secrets.MIREN_CLUSTER_PROD }}
+          app: chitchat
