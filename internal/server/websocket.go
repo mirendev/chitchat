@@ -29,6 +29,17 @@ const (
 	pingPeriod = (pongWait * 9) / 10
 	writeWait  = 10 * time.Second
 
+	// subscribeFlushTimeout matches nats.go's Flush timeout. Keeping this as a
+	// context-bound flush lets a closing websocket cancel subscription setup
+	// instead of leaving its workers behind for the full timeout.
+	subscribeFlushTimeout = 10 * time.Second
+
+	// The reader and action dispatcher are deliberately separate. A bounded
+	// queue keeps a client from growing memory without limit while still giving
+	// the reader ample room to process websocket control frames during a NATS
+	// round trip.
+	wsActionQueueSize = 64
+
 	// sessionInactiveThreshold is how long a durable session consumer survives
 	// with no connection bound before JetStream cleans it up. A session that
 	// reconnects within this window resumes from where it left off; one gone
@@ -105,6 +116,11 @@ type wsOutbound struct {
 	WhoSubject string `json:"who_subject,omitempty"`
 }
 
+type wsAction struct {
+	msg         wsInbound
+	invalidJSON bool
+}
+
 func (s *Server) websocketHandler(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -119,15 +135,16 @@ func (s *Server) websocketHandler(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &wsConn{
-		conn:        conn,
-		server:      s,
-		logger:      s.logger,
-		ctx:         ctx,
-		cancel:      cancel,
-		principal:   principal,
-		subs:        make(map[string]*nats.Subscription),
-		jsConsumers: make(map[string]*jsSub),
-		streams:     make(map[string]*streamState),
+		conn:           conn,
+		server:         s,
+		logger:         s.logger,
+		ctx:            ctx,
+		cancel:         cancel,
+		principal:      principal,
+		subs:           make(map[string]*nats.Subscription),
+		coreSubPending: make(map[string]chan struct{}),
+		jsConsumers:    make(map[string]*jsSub),
+		streams:        make(map[string]*streamState),
 	}
 	c.run()
 }
@@ -157,18 +174,31 @@ type wsConn struct {
 
 	principal *auth.Principal // verified identity, captured at upgrade
 
-	writeMu     sync.Mutex
-	mu          sync.Mutex
-	subs        map[string]*nats.Subscription // core NATS subscriptions, keyed by subject
-	jsConsumers map[string]*jsSub             // durable session consumers, keyed by subject
-	streams     map[string]*streamState       // in-flight request_stream, keyed by stream_id
+	writeMu sync.Mutex
+	mu      sync.Mutex
+	subs    map[string]*nats.Subscription // core NATS subscriptions, keyed by subject
+
+	coreSubMu      sync.Mutex
+	coreSubPending map[string]chan struct{} // serializes concurrent requests for the same subject
+
+	jsConsumers map[string]*jsSub       // durable session consumers, keyed by subject
+	streams     map[string]*streamState // in-flight request_stream, keyed by stream_id
 }
 
 func (c *wsConn) run() {
 	done := make(chan struct{})
+	actions := make(chan wsAction, wsActionQueueSize)
+	dispatchDone := make(chan struct{})
+	go func() {
+		defer close(dispatchDone)
+		c.dispatchActions(actions)
+	}()
+
 	defer func() {
 		close(done)
 		c.cancel()
+		close(actions)
+		<-dispatchDone
 		c.mu.Lock()
 		for subj, sub := range c.subs {
 			sub.Unsubscribe()
@@ -214,6 +244,39 @@ func (c *wsConn) run() {
 
 		var msg wsInbound
 		if err := json.Unmarshal(raw, &msg); err != nil {
+			actions <- wsAction{invalidJSON: true}
+			continue
+		}
+		actions <- wsAction{msg: msg}
+	}
+}
+
+// dispatchActions preserves action ordering without making the websocket
+// reader wait on NATS. Consecutive core subscriptions are independent, so they
+// can register and flush concurrently. Before any later action runs, the
+// dispatcher waits for all preceding subscriptions; a publish following a
+// subscribe therefore keeps the same no-missed-message guarantee as before.
+func (c *wsConn) dispatchActions(actions <-chan wsAction) {
+	var coreSubscribes sync.WaitGroup
+	for action := range actions {
+		if c.ctx.Err() != nil {
+			break
+		}
+		msg := action.msg
+		if !action.invalidJSON && msg.Action == "subscribe" && msg.SessionID == "" {
+			coreSubscribes.Add(1)
+			go func() {
+				defer coreSubscribes.Done()
+				c.handleSubscribe(msg)
+			}()
+			continue
+		}
+
+		coreSubscribes.Wait()
+		if c.ctx.Err() != nil {
+			break
+		}
+		if action.invalidJSON {
 			c.send(wsOutbound{Type: "error", Error: "invalid json"})
 			continue
 		}
@@ -245,6 +308,7 @@ func (c *wsConn) run() {
 			c.send(wsOutbound{Type: "error", Error: "unknown action: " + msg.Action})
 		}
 	}
+	coreSubscribes.Wait()
 }
 
 func (c *wsConn) handleSubscribe(msg wsInbound) {
@@ -259,12 +323,18 @@ func (c *wsConn) handleSubscribe(msg wsInbound) {
 		return
 	}
 
+	release, ok := c.acquireCoreSubscribe(msg.Subject)
+	if !ok {
+		return
+	}
+	defer release()
+
 	c.mu.Lock()
 	_, exists := c.subs[msg.Subject]
 	c.mu.Unlock()
 
 	if exists {
-		c.send(wsOutbound{Type: "error", Error: "already subscribed to " + msg.Subject})
+		c.send(wsOutbound{Type: "error", Subject: msg.Subject, Error: "already subscribed to " + msg.Subject})
 		return
 	}
 
@@ -284,24 +354,72 @@ func (c *wsConn) handleSubscribe(msg wsInbound) {
 		c.send(out)
 	})
 	if err != nil {
-		c.send(wsOutbound{Type: "error", Error: "subscribe failed: " + err.Error()})
+		c.logger.Error("subscribe failed", "subject", msg.Subject, "err", err)
+		c.send(wsOutbound{Type: "error", Subject: msg.Subject, Error: "subscribe failed: " + err.Error()})
 		return
 	}
+
+	// A second concurrent subscribe may have passed the fast existence check
+	// before this one registered. Claim the subject before the blocking flush so
+	// exactly one worker owns it and later ordered actions can see it.
+	c.mu.Lock()
+	if _, exists := c.subs[msg.Subject]; exists {
+		c.mu.Unlock()
+		sub.Unsubscribe()
+		c.send(wsOutbound{Type: "error", Subject: msg.Subject, Error: "already subscribed to " + msg.Subject})
+		return
+	}
+	c.subs[msg.Subject] = sub
+	c.mu.Unlock()
 
 	// Flush so the SUB has reached the server before we confirm. Otherwise the
 	// "subscribed" ack races ahead of the registered interest and messages
 	// published in that window are silently dropped by core NATS.
-	if err := c.server.nc.Flush(); err != nil {
+	flushCtx, cancel := context.WithTimeout(c.ctx, subscribeFlushTimeout)
+	defer cancel()
+	if err := c.server.nc.FlushWithContext(flushCtx); err != nil {
+		c.mu.Lock()
+		if c.subs[msg.Subject] == sub {
+			delete(c.subs, msg.Subject)
+		}
+		c.mu.Unlock()
 		sub.Unsubscribe()
-		c.send(wsOutbound{Type: "error", Error: "subscribe flush failed: " + err.Error()})
+		c.logger.Error("subscribe flush failed", "subject", msg.Subject, "err", err)
+		c.send(wsOutbound{Type: "error", Subject: msg.Subject, Error: "subscribe flush failed: " + err.Error()})
 		return
 	}
 
-	c.mu.Lock()
-	c.subs[msg.Subject] = sub
-	c.mu.Unlock()
-
 	c.send(wsOutbound{Type: "subscribed", Subject: msg.Subject})
+}
+
+// acquireCoreSubscribe lets different subjects set up concurrently while
+// preserving response order for repeated requests on one subject. Without the
+// per-subject gate, a duplicate worker could report its error before the first
+// worker reported success, causing a replay waiter to reject a subscription
+// that was about to become live.
+func (c *wsConn) acquireCoreSubscribe(subject string) (func(), bool) {
+	for {
+		c.coreSubMu.Lock()
+		pending, exists := c.coreSubPending[subject]
+		if !exists {
+			pending = make(chan struct{})
+			c.coreSubPending[subject] = pending
+			c.coreSubMu.Unlock()
+			return func() {
+				c.coreSubMu.Lock()
+				delete(c.coreSubPending, subject)
+				close(pending)
+				c.coreSubMu.Unlock()
+			}, true
+		}
+		c.coreSubMu.Unlock()
+
+		select {
+		case <-pending:
+		case <-c.ctx.Done():
+			return nil, false
+		}
+	}
 }
 
 // handleDurableSubscribe backs the subscription with a JetStream durable
@@ -316,7 +434,7 @@ func (c *wsConn) handleDurableSubscribe(msg wsInbound) {
 	_, exists := c.jsConsumers[subject]
 	c.mu.Unlock()
 	if exists {
-		c.send(wsOutbound{Type: "error", Error: "already subscribed to " + subject})
+		c.send(wsOutbound{Type: "error", Subject: subject, Error: "already subscribed to " + subject})
 		return
 	}
 
@@ -328,10 +446,10 @@ func (c *wsConn) handleDurableSubscribe(msg wsInbound) {
 	streamName, err := c.server.js.StreamNameBySubject(apiCtx, subject)
 	if err != nil {
 		if errors.Is(err, jetstream.ErrStreamNotFound) {
-			c.send(wsOutbound{Type: "error", Error: "no durable stream captures subject " + subject + " (create one via POST /v1/streams)"})
+			c.send(wsOutbound{Type: "error", Subject: subject, Error: "no durable stream captures subject " + subject + " (create one via POST /v1/streams)"})
 			return
 		}
-		c.send(wsOutbound{Type: "error", Error: "resolve stream failed: " + err.Error()})
+		c.send(wsOutbound{Type: "error", Subject: subject, Error: "resolve stream failed: " + err.Error()})
 		return
 	}
 
@@ -353,7 +471,7 @@ func (c *wsConn) handleDurableSubscribe(msg wsInbound) {
 		})
 	}
 	if err != nil {
-		c.send(wsOutbound{Type: "error", Error: "consumer setup failed: " + err.Error()})
+		c.send(wsOutbound{Type: "error", Subject: subject, Error: "consumer setup failed: " + err.Error()})
 		return
 	}
 
@@ -394,7 +512,7 @@ func (c *wsConn) handleDurableSubscribe(msg wsInbound) {
 		}),
 	)
 	if err != nil {
-		c.send(wsOutbound{Type: "error", Error: "consume failed: " + err.Error()})
+		c.send(wsOutbound{Type: "error", Subject: subject, Error: "consume failed: " + err.Error()})
 		return
 	}
 

@@ -325,6 +325,66 @@ func TestReplayFailureDropsConnection(t *testing.T) {
 	})
 }
 
+// TestSubscribeErrorFailsWaiterImmediately covers the observable half of
+// MIR-1712. Current gateways correlate subscribe errors with a subject, so a
+// waiter should receive the rejection instead of burning its entire deadline
+// waiting for a "subscribed" acknowledgement that will never arrive.
+func TestSubscribeErrorFailsWaiterImmediately(t *testing.T) {
+	up := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			_, data, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			var msg struct {
+				Action  string `json:"action"`
+				Subject string `json:"subject"`
+			}
+			if json.Unmarshal(data, &msg) != nil || msg.Action != "subscribe" {
+				continue
+			}
+			_ = conn.WriteJSON(map[string]any{
+				"type":    "error",
+				"subject": msg.Subject,
+				"error":   "subscribe flush failed: permissions denied",
+			})
+		}
+	}))
+	defer srv.Close()
+
+	c, err := New(srv.URL, StaticToken("token"), quietLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := t.Context()
+	go func() { _ = c.Run(ctx) }()
+	waitConnected(t, c)
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	err = c.SubscribeAndWait(waitCtx, "code.prs", func(context.Context, Message) {})
+	if err == nil || !strings.Contains(err.Error(), "permissions denied") {
+		t.Fatalf("SubscribeAndWait error = %v, want correlated gateway error", err)
+	}
+	if elapsed := time.Since(start); elapsed >= 500*time.Millisecond {
+		t.Fatalf("SubscribeAndWait took %v; gateway rejection should fail immediately", elapsed)
+	}
+
+	c.mu.Lock()
+	_, stillRegistered := c.subs["code.prs"]
+	c.mu.Unlock()
+	if stillRegistered {
+		t.Fatal("failed SubscribeAndWait left the subscription registered")
+	}
+}
+
 // TestRequestReturnsErrNoResponders covers the loose end from the incident.
 // NATS answers a request with no listeners by synthesizing an empty message
 // carrying "Status: 503", and the gateway relays it verbatim. The old client
