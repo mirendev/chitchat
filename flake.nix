@@ -18,7 +18,7 @@
       in {
         devShells.default = pkgs.mkShell {
           packages = [
-            pkgs.go_1_25
+            pkgs.go_1_27
             pkgs.golangci-lint
             pkgs.gotools
             pkgs.nats-server # run-nats.sh wants this to stand up the bus locally
