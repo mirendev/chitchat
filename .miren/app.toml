@@ -25,6 +25,12 @@ key = "NATS_URL"
 value = "nats://nats.app.miren:4222"
 
 [[env]]
+key = "NATS_TOKEN"
+backend = "cluster"
+ref = "chitchat/nats-token"
+description = "Shared secret between the gateway and NATS, so nothing else on the cluster can connect to the bus directly"
+
+[[env]]
 key = "GATEWAY_API_KEY"
 required = true
 sensitive = true
