@@ -64,6 +64,7 @@ func run(logger *slog.Logger) error {
 	)
 	for {
 		nc, err = nats.Connect(natsURL,
+			nats.Token(os.Getenv("NATS_TOKEN")),
 			nats.MaxReconnects(-1),
 			nats.ReconnectWait(time.Second),
 			nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {

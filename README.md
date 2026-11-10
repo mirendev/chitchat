@@ -56,6 +56,8 @@ Delivery semantics are per-subscription. `Subscribe` is a plain core NATS subscr
 
 ```bash
 cd chitchat
+# NATS_TOKEN comes from this secret, so it has to exist before the first deploy.
+miren secret set -C garden chitchat/nats-token --value "nats_$(openssl rand -hex 32)"
 miren deploy -C garden
 miren env set -C garden -a chitchat GATEWAY_API_KEY=$(openssl rand -base64 32)
 ```
